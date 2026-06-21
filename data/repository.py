@@ -88,6 +88,11 @@ def delete_holding(conn: sqlite3.Connection, code: str) -> bool:
 
 # ── trades ──────────────────────────────────────────────────
 
+def get_trade(conn: sqlite3.Connection, trade_id: int) -> Optional[dict]:
+    row = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+    return _trade_row_to_dict(row) if row else None
+
+
 def list_trades(conn: sqlite3.Connection, code: Optional[str] = None) -> list[dict]:
     if code:
         rows = conn.execute(
@@ -131,6 +136,44 @@ def delete_trade(conn: sqlite3.Connection, trade_id: int) -> bool:
     cur = conn.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
     conn.commit()
     return cur.rowcount > 0
+
+
+def sync_holding_from_trades(conn: sqlite3.Connection, code: str) -> None:
+    """約定履歴から保有の建値・株数を再計算して更新する。
+
+    - 全 BUY 約定の加重平均を avg_price とする
+    - 残株数 = BUY 合計 - SELL 合計
+    - 保有テーブルに銘柄が存在しない場合はスキップ
+    - BUY 約定が1件もない場合は avg_price を変更せず株数だけ更新
+    """
+    if get_holding(conn, code) is None:
+        return
+
+    rows = conn.execute(
+        "SELECT side, shares, price FROM trades WHERE code = ?", (code,)
+    ).fetchall()
+
+    if not rows:
+        return
+
+    buy_shares = sum(r["shares"] for r in rows if r["side"] == "BUY")
+    sell_shares = sum(r["shares"] for r in rows if r["side"] == "SELL")
+    buy_amount = sum(r["shares"] * r["price"] for r in rows if r["side"] == "BUY")
+
+    avg_price = buy_amount / buy_shares if buy_shares > 0 else None
+    remaining = max(0.0, buy_shares - sell_shares)
+
+    conn.execute(
+        """
+        UPDATE holdings SET
+            avg_price  = CASE WHEN :avg_price IS NOT NULL THEN :avg_price ELSE avg_price END,
+            shares     = :shares,
+            updated_at = datetime('now')
+        WHERE code = :code
+        """,
+        {"code": code, "avg_price": avg_price, "shares": remaining},
+    )
+    conn.commit()
 
 
 def realized_pnl(conn: sqlite3.Connection) -> list[dict]:

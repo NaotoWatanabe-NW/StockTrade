@@ -22,6 +22,19 @@ def db_path() -> str:
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS price_history (
+    code      TEXT NOT NULL,
+    interval  TEXT NOT NULL,         -- "1d" / "1wk"
+    date      TEXT NOT NULL,         -- YYYY-MM-DD
+    open      REAL,
+    high      REAL,
+    low       REAL,
+    close     REAL,
+    volume    REAL,
+    PRIMARY KEY (code, interval, date)
+);
+CREATE INDEX IF NOT EXISTS idx_price_code ON price_history(code, interval, date);
+
 CREATE TABLE IF NOT EXISTS holdings (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     code       TEXT    NOT NULL UNIQUE,

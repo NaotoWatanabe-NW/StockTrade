@@ -9,6 +9,7 @@ from data.db import get_connection
 from data.repository import (
     list_holdings, get_holding, upsert_holding, delete_holding,
     list_trades, add_trade, delete_trade, realized_pnl,
+    sync_holding_from_trades,
 )
 
 
@@ -78,6 +79,38 @@ class TestTrades:
         t = add_trade(conn, code="7203", side="BUY", shares=100, price=2700, traded_at="2026-06-01")
         assert delete_trade(conn, t["id"]) is True
         assert list_trades(conn) == []
+
+
+class TestSyncHoldingFromTrades:
+    def test_buy_trade_updates_avg_price_and_shares(self, conn):
+        upsert_holding(conn, code="7203", name="トヨタ", avg_price=2700, shares=100)
+        add_trade(conn, code="7203", side="BUY", shares=100, price=2700, traded_at="2026-01-01")
+        add_trade(conn, code="7203", side="BUY", shares=100, price=2900, traded_at="2026-02-01")
+        sync_holding_from_trades(conn, "7203")
+        h = get_holding(conn, "7203")
+        assert h["avg_price"] == 2800.0   # (2700+2900)/2
+        assert h["shares"] == 200
+
+    def test_sell_trade_reduces_shares(self, conn):
+        upsert_holding(conn, code="7203", name="トヨタ", avg_price=2700, shares=200)
+        add_trade(conn, code="7203", side="BUY", shares=200, price=2700, traded_at="2026-01-01")
+        add_trade(conn, code="7203", side="SELL", shares=50, price=3000, traded_at="2026-02-01")
+        sync_holding_from_trades(conn, "7203")
+        h = get_holding(conn, "7203")
+        assert h["shares"] == 150
+        assert h["avg_price"] == 2700.0   # avg_price は BUY のみで計算
+
+    def test_skips_when_holding_not_registered(self, conn):
+        # holdingsに存在しない銘柄はスキップ（例外を出さない）
+        add_trade(conn, code="XXXX", side="BUY", shares=10, price=100, traded_at="2026-01-01")
+        sync_holding_from_trades(conn, "XXXX")  # raises しない
+        assert get_holding(conn, "XXXX") is None
+
+    def test_no_trades_leaves_holding_unchanged(self, conn):
+        upsert_holding(conn, code="7203", avg_price=2700, shares=100)
+        sync_holding_from_trades(conn, "7203")  # 約定記録ゼロ → 何もしない
+        h = get_holding(conn, "7203")
+        assert h["avg_price"] == 2700 and h["shares"] == 100
 
 
 class TestRealizedPnl:
