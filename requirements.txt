@@ -1,0 +1,12 @@
+yfinance>=0.2.40
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+
+# 取引記録Webアプリのバックエンド
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# 開発・テスト
+pytest>=8.0
+httpx>=0.27

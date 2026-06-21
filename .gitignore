@@ -1,0 +1,25 @@
+# 仮想環境
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ログ
+*.log
+
+# 秘密情報・個人情報（コミット禁止）
+.env
+holdings_local.py
+
+# データベース（個人の保有・取引記録）
+*.db
+stock.db
+
+# Next.js / Node
+web/node_modules/
+web/.next/
+web/out/
+web/.env.local
