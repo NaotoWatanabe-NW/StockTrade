@@ -23,6 +23,7 @@ from typing import Optional
 import pandas as pd
 
 from core.indicators import add_technical_indicators, detect_signals
+from core.regime import apply_regime_filters
 from core.risk import calc_shares, lot_size_for_market
 from core.scoring import compute_consensus, Consensus, DEFAULT_SCORING_CONFIG
 from core.trade_plan import net_side, entry_style, build_trade_plan
@@ -49,6 +50,9 @@ def evaluate(
     trade_plan_cfg: Optional[dict] = None,
     risk_cfg: Optional[dict] = None,
     market_code: str = "JP",
+    regime_cfg: Optional[dict] = None,
+    df_weekly: Optional[pd.DataFrame] = None,
+    df_index: Optional[pd.DataFrame] = None,
 ) -> Optional[Decision]:
     """
     OHLCV DataFrame の最新バーに対して意思決定を行い Decision を返す。
@@ -98,6 +102,12 @@ def evaluate(
             lot_size=lot,
         )
 
+    # レジームフィルタ（regime_cfg が渡されたときのみ適用）
+    filters: dict = {}
+    if regime_cfg:
+        t_date = df.index[-1]
+        filters = apply_regime_filters(df, t_date, df_weekly, df_index, regime_cfg)
+
     return Decision(
         price=price,
         change_pct=change_pct,
@@ -107,4 +117,5 @@ def evaluate(
         consensus=consensus,
         trade_plan=plan,
         shares=shares,
+        filters=filters,
     )

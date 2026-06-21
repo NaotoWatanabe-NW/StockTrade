@@ -57,11 +57,65 @@ CREATE TABLE IF NOT EXISTS trades (
     fee        REAL    NOT NULL DEFAULT 0,     -- 手数料
     traded_at  TEXT    NOT NULL,               -- 約定日 YYYY-MM-DD
     note       TEXT,
+    signal_id  INTEGER,                        -- 紐付くシグナル（NULL=シグナル外の取引）
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_code ON trades(code);
+
+-- スクリーナーが出したシグナル（注文プラン）の記録。
+-- 実取引の結果をフィードバックし、ライブ成績をバックテスト期待値と比較するための土台。
+--   status: OPEN(発生)→TAKEN(約定済)→CLOSED(決済完了) / SKIPPED(見送り) / EXPIRED(期限切れ)
+CREATE TABLE IF NOT EXISTS signals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    generated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    code          TEXT    NOT NULL,
+    name          TEXT,
+    market        TEXT,                        -- "JP"/"US"
+    side          TEXT    NOT NULL,            -- "BUY"/"SELL"
+    signal_types  TEXT,                        -- JSON配列（["BREAKOUT_HIGH",...]）
+    score         REAL,                        -- 合議スコア
+    entry_price   REAL,                        -- 計画指値
+    stop_price    REAL,                        -- 計画損切り
+    target_price  REAL,                        -- 計画利確
+    risk          REAL,                        -- 1R = entry - stop（1株あたり）
+    entry_kind    TEXT,                        -- "LIMIT"/"STOP"
+    order_type    TEXT,                        -- "IFDOCO" など
+    status        TEXT    NOT NULL DEFAULT 'OPEN',
+    realized_r    REAL,                        -- 決済完了後に計算した実現R
+    notes         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
+CREATE INDEX IF NOT EXISTS idx_signals_code   ON signals(code);
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at          TEXT    NOT NULL DEFAULT (datetime('now')),  -- 実行日時 ISO
+    universe        TEXT    NOT NULL,           -- "JP" / "US" / "ALL"
+    n_signals       INTEGER,
+    n_filled        INTEGER,
+    fill_rate       REAL,
+    n_closed        INTEGER,
+    win_rate        REAL,
+    avg_r           REAL,
+    profit_factor   REAL,
+    max_drawdown_r  REAL,
+    time_stop_rate  REAL,
+    params          TEXT,                       -- JSON: 使用した主要パラメータ
+    sharpe          REAL,                       -- Phase 7: シャープレシオ（年率換算）
+    annual_return_pct REAL,                     -- Phase 7: 年率リターン%（複利）
+    equity_curve    TEXT                        -- Phase 7: 資産曲線 JSON
+);
 """
+
+# 既存 DB への後方互換マイグレーション（列が無ければ追加）
+_MIGRATIONS = [
+    "ALTER TABLE backtest_runs ADD COLUMN sharpe REAL",
+    "ALTER TABLE backtest_runs ADD COLUMN annual_return_pct REAL",
+    "ALTER TABLE backtest_runs ADD COLUMN equity_curve TEXT",
+    "ALTER TABLE trades ADD COLUMN signal_id INTEGER",
+]
 
 
 def get_connection(path: str | None = None) -> sqlite3.Connection:
@@ -75,4 +129,10 @@ def get_connection(path: str | None = None) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # 既存 DB に新列がなければ追加（ALTER TABLE はべき等でないため try/except で無視）
+    for sql in _MIGRATIONS:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # 既に列が存在する場合
     conn.commit()

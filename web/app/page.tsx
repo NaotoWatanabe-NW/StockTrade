@@ -6,9 +6,11 @@ import {
   Holding,
   Trade,
   PnlRow,
+  PortfolioHeat,
   getHoldings,
   getTrades,
   getPnl,
+  getPortfolioHeat,
   isJP,
 } from "@/lib/api";
 
@@ -16,16 +18,18 @@ export default function DashboardPage() {
   const [holdings, setHoldings] = useState<Holding[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [pnl, setPnl] = useState<PnlRow[]>([]);
+  const [heat, setHeat] = useState<PortfolioHeat | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
     // 1つのAPIが落ちても他の表示は壊さない（部分失敗時のみエラー表示）
-    Promise.allSettled([getHoldings(), getTrades(), getPnl()]).then(
-      ([h, t, p]) => {
+    Promise.allSettled([getHoldings(), getTrades(), getPnl(), getPortfolioHeat()]).then(
+      ([h, t, p, hh]) => {
         if (h.status === "fulfilled") setHoldings(h.value);
         if (t.status === "fulfilled") setTrades(t.value);
         if (p.status === "fulfilled") setPnl(p.value);
-        const failed = [h, t, p].find((r) => r.status === "rejected") as
+        if (hh.status === "fulfilled") setHeat(hh.value);
+        const failed = [h, t, p, hh].find((r) => r.status === "rejected") as
           | PromiseRejectedResult
           | undefined;
         if (failed) setError(String(failed.reason.message ?? failed.reason));
@@ -75,6 +79,17 @@ export default function DashboardPage() {
             ${usRealized.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </div>
         </div>
+        {heat && (
+          <div className="panel card">
+            <div className="label">ポートフォリオ熱量</div>
+            <div className={`value ${heat.heat_pct >= heat.heat_max_pct ? "neg" : heat.heat_pct >= heat.heat_max_pct * 0.8 ? "" : "pos"}`}>
+              {heat.heat_pct.toFixed(1)}%
+            </div>
+            <div className="muted">
+              上限 {heat.heat_max_pct.toFixed(1)}%（{heat.open_positions}/{heat.max_positions}件）
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="panel" style={{ marginTop: 20 }}>
@@ -88,6 +103,9 @@ export default function DashboardPage() {
           </Link>
           <Link href="/pnl">
             <button className="ghost">損益を見る</button>
+          </Link>
+          <Link href="/backtest">
+            <button className="ghost">バックテスト履歴</button>
           </Link>
         </div>
       </div>

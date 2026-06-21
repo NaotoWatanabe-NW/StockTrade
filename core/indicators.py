@@ -54,6 +54,24 @@ def add_technical_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
     d["macd_hist"]   = d["macd"] - d["macd_signal"]
 
+    # ADX（14期間・Wilder平滑）。トレンド強度の計測。
+    # adx >= REGIME_CONFIG["adx_min"]（推奨20）でトレンド相場と判定。
+    adx_period = 14
+    dm_plus  = d["high"].diff().clip(lower=0)
+    dm_minus = (-d["low"].diff()).clip(lower=0)
+    # +DM/-DM: どちらか大きい方だけ採用（同点は0）
+    dm_plus  = dm_plus.where(dm_plus > dm_minus, 0.0)
+    dm_minus = dm_minus.where(dm_minus > dm_plus, 0.0)
+    alpha_adx = 1.0 / adx_period
+    atr_s    = tr.ewm(alpha=alpha_adx, adjust=False).mean()
+    dmp_s    = dm_plus.ewm(alpha=alpha_adx, adjust=False).mean()
+    dmm_s    = dm_minus.ewm(alpha=alpha_adx, adjust=False).mean()
+    d["adx_plus_di"]  = 100 * dmp_s / atr_s.replace(0, np.nan)
+    d["adx_minus_di"] = 100 * dmm_s / atr_s.replace(0, np.nan)
+    dx = (100 * (d["adx_plus_di"] - d["adx_minus_di"]).abs()
+          / (d["adx_plus_di"] + d["adx_minus_di"]).replace(0, np.nan))
+    d["adx"] = dx.ewm(alpha=alpha_adx, adjust=False).mean()
+
     return d
 
 

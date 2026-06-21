@@ -106,7 +106,26 @@ def run_once(screener: StockScreener, notifier: DiscordNotifier, markets: set[st
     log.info(f"✅ {len(results)}銘柄でシグナル検出")
     notifier.notify_screening_result(results)
 
+    # ── 3. シグナルをDBに記録（実取引フィードバック用） ──
+    _persist_signals(results)
+
     log.info("📊 チェック完了\n")
+
+
+def _persist_signals(results: list[dict]) -> None:
+    """スキャン結果を signals テーブルに保存する（失敗しても監視は止めない）。"""
+    try:
+        from data.db import get_connection
+        from data.repository import expire_stale_signals
+        from screener.signal_log import record_scan_signals
+        conn = get_connection()
+        try:
+            expire_stale_signals(conn, config.BACKTEST_CONFIG.get("entry_order_valid_days", 15))
+            record_scan_signals(conn, results)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning(f"シグナル記録に失敗しました（監視は継続）: {e}")
 
 
 def main():
@@ -131,11 +150,20 @@ def main():
         raise SystemExit(0 if ok else 1)
 
     client   = StockDataClient(rate_limit_sec=1.0)
-    screener = StockScreener(client, config.SCREENING_CONFIG,
-                             config.TRADE_PLAN_CONFIG, config.ORDER_CONFIG,
-                             config.SCORING_CONFIG)
+    screener = StockScreener(
+        client,
+        config.SCREENING_CONFIG,
+        config.TRADE_PLAN_CONFIG,
+        config.ORDER_CONFIG,
+        scoring_config=config.SCORING_CONFIG,
+        risk_config=config.RISK_CONFIG,       # Phase 2: 推奨株数サイジング
+        regime_config=config.REGIME_CONFIG,   # Phase 3: 週足/指数/ADX フィルタ
+        events_config=config.EVENTS_CONFIG,   # Phase 3: 決算回避フィルタ
+    )
 
-    notifier.notify_startup(len(config.get_holdings()), len(config.SCREENING_UNIVERSE))
+    holdings_count = len(config.get_holdings())
+    notifier.notify_startup(holdings_count, len(config.SCREENING_UNIVERSE),
+                            risk_config=config.RISK_CONFIG)
 
     if not args.loop:
         run_once(screener, notifier)  # 単発は全市場をスキャン

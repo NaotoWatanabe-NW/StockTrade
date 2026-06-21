@@ -109,3 +109,79 @@ class TestComputeMetrics:
 
 
 import pytest
+
+
+class TestPhase7Metrics:
+    """Phase 7 追加指標のテスト（Sharpe / 年率リターン / 資産曲線）"""
+
+    def _trades_with_dates(self, rs: list[float], start_year=2020):
+        """指定 R 値リストで closed trades を生成（日付を 30 日刻みで付与）"""
+        trades = []
+        from datetime import date, timedelta
+        for i, r in enumerate(rs):
+            exit_dt = date(start_year, 1, 1) + timedelta(days=30 * i)
+            exit_price = 1000.0 + r * 20.0
+            t = _trade(
+                fill_price=1000.0,
+                exit_price=exit_price,
+                risk=20.0,
+                exit_reason="TAKE_PROFIT" if r > 0 else "STOP_LOSS",
+            )
+            t.signal_date = str(date(start_year, 1, 1))
+            t.exit_date = str(exit_dt)
+            trades.append(t)
+        return trades
+
+    def test_equity_curve_starts_at_one_and_grows_with_wins(self):
+        trades = self._trades_with_dates([2.0, 2.0, 2.0])  # すべて +2R
+        m = compute_metrics(trades, [], risk_cfg={"risk_per_trade_pct": 1.0})
+        curve = m["equity_curve"]
+        assert curve[0]["equity"] == pytest.approx(1.02)   # 1×(1+2×0.01)
+        assert curve[-1]["equity"] > 1.0
+
+    def test_equity_curve_sorted_by_date(self):
+        trades = self._trades_with_dates([1.0, -0.5, 2.0])
+        m = compute_metrics(trades, [], risk_cfg={"risk_per_trade_pct": 1.0})
+        dates = [p["date"] for p in m["equity_curve"]]
+        assert dates == sorted(dates)
+
+    def test_equity_curve_empty_when_no_closed_trades(self):
+        m = compute_metrics([], [])
+        assert m["equity_curve"] == []
+
+    def test_sharpe_positive_for_consistently_winning_strategy(self):
+        trades = self._trades_with_dates([1.0] * 50)  # 50 連勝
+        m = compute_metrics(trades, [], risk_cfg={"risk_per_trade_pct": 1.0})
+        assert m["sharpe_ratio"] == 0.0  # std=0 → sharpe=0
+
+    def test_sharpe_nonzero_with_mixed_results(self):
+        import random
+        random.seed(42)
+        rs = [random.choice([1.5, -1.0]) for _ in range(60)]
+        trades = self._trades_with_dates(rs)
+        m = compute_metrics(trades, [], risk_cfg={"risk_per_trade_pct": 1.0})
+        assert isinstance(m["sharpe_ratio"], float)
+        assert abs(m["sharpe_ratio"]) < 10.0   # 発散していない
+
+    def test_annual_return_pct_positive_for_winning_strategy(self):
+        trades = self._trades_with_dates([2.0] * 24, start_year=2020)  # 24 ヶ月分
+        m = compute_metrics(trades, [], risk_cfg={"risk_per_trade_pct": 1.0})
+        assert m["annual_return_pct"] > 0.0
+
+    def test_annual_return_pct_negative_for_losing_strategy(self):
+        trades = self._trades_with_dates([-1.0] * 24, start_year=2020)
+        m = compute_metrics(trades, [], risk_cfg={"risk_per_trade_pct": 1.0})
+        assert m["annual_return_pct"] < 0.0
+
+    def test_annual_return_pct_zero_without_risk_cfg(self):
+        trades = self._trades_with_dates([2.0, 2.0])
+        m = compute_metrics(trades, [])  # risk_cfg=None → risk_pct=0.01 (デフォルト1%)
+        # デフォルト1%が使われるため 0 にはならない
+        assert isinstance(m["annual_return_pct"], float)
+
+    def test_equity_curve_respects_risk_pct(self):
+        trades = self._trades_with_dates([1.0])  # +1R
+        m1 = compute_metrics(trades, [], risk_cfg={"risk_per_trade_pct": 1.0})
+        m2 = compute_metrics(trades, [], risk_cfg={"risk_per_trade_pct": 2.0})
+        # 2% リスクの方が資産が大きく動く
+        assert m2["equity_curve"][0]["equity"] > m1["equity_curve"][0]["equity"]

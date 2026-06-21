@@ -6,13 +6,14 @@ Discord Webhook通知
   2. WebhookのURLをコピー
   3. 環境変数 DISCORD_WEBHOOK_URL に設定
 
-通知には「注文プラン（指値・損切り・利確）」と保有銘柄の含み損益を含める。
+通知には「注文プラン（指値・損切り・利確）」「推奨株数」「保有銘柄の含み損益」を含める。
 価格は各銘柄の市場通貨（¥ / $）で表記する。
 """
 
 import logging
 import requests
 from datetime import datetime, timezone
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -21,12 +22,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _order_field(order, plan: dict, market) -> dict | None:
+def _order_field(order, plan: dict, market) -> Optional[dict]:
     """注文プラン(OrderPlan) → Discord embed フィールド（SBI注文タイプ＋各レッグ）"""
     if order is None:
         return None
     lines = [leg.text(market) for leg in order.legs]
-    # リスク/リワードの補足
     if plan:
         rr = []
         if plan.get("risk_pct") is not None:
@@ -52,7 +52,7 @@ def _order_summary(order, market) -> str:
     return f"\n└ [{order.order_type}] {legs}"
 
 
-def _score_field(score) -> dict | None:
+def _score_field(score) -> Optional[dict]:
     """合議制スコア(Consensus) → Discord embed フィールド（寄与上位を併記）"""
     if score is None:
         return None
@@ -70,6 +70,30 @@ def _score_summary(score) -> str:
     if score is None:
         return ""
     return f"\n└ 🧭 {score.jp_label}（スコア {score.score:+.0f}）"
+
+
+def _shares_summary(shares: Optional[int], market) -> str:
+    """推奨株数のサマリ行（1行）"""
+    if shares is None or shares == 0:
+        return ""
+    unit = "株" if market.code == "JP" else "株"
+    return f"\n└ 📦 推奨株数: {shares:,}{unit}"
+
+
+def _regime_summary(filters: dict) -> str:
+    """レジームフィルタの通過状態を1行で表現"""
+    if not filters:
+        return ""
+    icons = {
+        "weekly_trend":  ("📈", "週足↑"),
+        "index_regime":  ("🌐", "指数↑"),
+        "adx":           ("📊", "ADX↑"),
+    }
+    parts = []
+    for key, (icon, label) in icons.items():
+        if key in filters:
+            parts.append(f"{icon}{label}{'✓' if filters[key] else '✗'}")
+    return "\n└ " + "  ".join(parts) if parts else ""
 
 
 class DiscordNotifier:
@@ -109,7 +133,7 @@ class DiscordNotifier:
             return False
 
     def notify_holding_signal(self, h: dict):
-        """保有銘柄のシグナル通知（含み損益＋注文プラン付き）"""
+        """保有銘柄のシグナル通知（含み損益＋推奨株数＋注文プラン付き）"""
         market = h["market"]
         signals = h["signals"]
         labels = "、".join(s["label"] for s in signals)
@@ -126,6 +150,12 @@ class DiscordNotifier:
             if amt is not None:
                 pl += f"（{market.fmt(amt)}）"
             fields.append({"name": "含み損益", "value": pl, "inline": True})
+        if h.get("suggested_shares"):
+            fields.append({
+                "name": "推奨株数",
+                "value": f"{h['suggested_shares']:,}株",
+                "inline": True,
+            })
 
         score_field = _score_field(h.get("score"))
         if score_field:
@@ -135,7 +165,6 @@ class DiscordNotifier:
         if order_field:
             fields.append(order_field)
 
-        # 長期保有銘柄は買い増しタイミング通知であることを明示
         title_prefix = "📌 長期保有・買い増し" if h.get("long_term") else "⚡ 保有銘柄シグナル"
 
         embed = {
@@ -149,7 +178,7 @@ class DiscordNotifier:
         self._send(embed)
 
     def notify_screening_result(self, results: list[dict]):
-        """スクリーニング結果をまとめて通知"""
+        """スクリーニング結果をまとめて通知（推奨株数・レジーム状態を追記）"""
         if not results:
             self._send({
                 "title": "📋 本日のスクリーニング結果",
@@ -160,7 +189,7 @@ class DiscordNotifier:
             return
 
         lines = []
-        for r in results[:15]:  # Discord embed制限を考慮
+        for r in results[:15]:  # Discord embed 文字数制限を考慮
             market = r["market"]
             line = (
                 f"**[{market.code}] {r['name']}（{r['code']}）** "
@@ -168,6 +197,8 @@ class DiscordNotifier:
                 f"└ {'、'.join(s['label'] for s in r['signals'])}"
             )
             line += _score_summary(r.get("score"))
+            line += _shares_summary(r.get("suggested_shares"), market)
+            line += _regime_summary(r.get("filters", {}))
             line += _order_summary(r.get("order"), market)
             lines.append(line)
 
@@ -187,13 +218,26 @@ class DiscordNotifier:
             "timestamp": _now_iso(),
         })
 
-    def notify_startup(self, holdings_count: int, universe_count: int):
+    def notify_startup(self, holdings_count: int, universe_count: int,
+                       risk_config: Optional[dict] = None):
+        """起動通知。risk_config が渡されれば口座情報・最大ポジション数も表示する。"""
+        desc_lines = [
+            f"保有銘柄監視: {holdings_count}銘柄",
+            f"スクリーニング対象: {universe_count}銘柄",
+        ]
+        if risk_config:
+            account  = risk_config.get("account_size", 0)
+            risk_pct = risk_config.get("risk_per_trade_pct", 1.0)
+            max_pos  = risk_config.get("max_positions", 5)
+            heat_now = holdings_count * risk_pct
+            desc_lines += [
+                f"口座サイズ: ¥{account:,.0f}",
+                f"1トレードリスク: {risk_pct}%  最大保有: {max_pos}件",
+                f"現在のポートフォリオ熱量: {heat_now:.1f}% / {max_pos * risk_pct:.1f}%",
+            ]
         self._send({
             "title": "🚀 株式監視ツール起動",
-            "description": (
-                f"保有銘柄監視: {holdings_count}銘柄\n"
-                f"スクリーニング対象: {universe_count}銘柄"
-            ),
+            "description": "\n".join(desc_lines),
             "color": 0x2ECC71,
             "timestamp": _now_iso(),
         })

@@ -32,6 +32,7 @@ import pandas as pd
 
 from core.exit_rules import ExitState, update_exit
 from core.indicators import add_technical_indicators, detect_signals
+from core.regime import apply_regime_filters
 from core.scoring import compute_consensus
 from core.trade_plan import net_side, entry_style, build_trade_plan
 
@@ -108,12 +109,18 @@ def simulate_symbol(
     trade_plan_cfg: dict,
     backtest_cfg: dict,
     exit_cfg: Optional[dict] = None,
+    regime_cfg: Optional[dict] = None,
+    df_weekly: Optional[pd.DataFrame] = None,
+    df_index: Optional[pd.DataFrame] = None,
 ) -> tuple[list[Trade], list[NoFill]]:
     """
     1 銘柄に対してバックテストを実行し、トレード履歴と不約定記録を返す。
 
     df_raw     : 生 OHLCV（指標列は内部で計算する）
     exit_cfg   : EXIT_CONFIG（None の場合は backtest_cfg のデフォルト値で動く簡易版）
+    regime_cfg : REGIME_CONFIG（None の場合はレジームフィルタを適用しない）
+    df_weekly  : 銘柄の週足 OHLCV（週足トレンドフィルタに使用）
+    df_index   : 指数の日足 OHLCV（指数レジームフィルタに使用）
 
     backtest_cfg の主なキー:
         entry_order_valid_days : エントリー注文の有効期限（営業日数）
@@ -231,6 +238,13 @@ def simulate_symbol(
         side = net_side(signals)
         if side != "BUY":
             continue
+
+        # ── 3a. レジームフィルタ（regime_cfg が渡されたときのみ適用）────
+        if regime_cfg:
+            t_date = df.index[t]
+            rf = apply_regime_filters(df_t, t_date, df_weekly, df_index, regime_cfg)
+            if not rf["passed"]:
+                continue
 
         consensus = compute_consensus(df_t, scoring_cfg)
         score = consensus.score if consensus else None

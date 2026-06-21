@@ -112,7 +112,7 @@ SCREENING_CONFIG = {
     "rsi_period":           14,
     "rsi_oversold":         30,
     "rsi_overbought":       70,
-    "breakout_lookback":    20,    # 高値・安値ブレイクアウト判定期間
+    "breakout_lookback":    30,    # 高値・安値ブレイクアウト判定期間（Phase8: 20→30。だましブレイク減・勝率↑）
     "min_price":            300,   # 監視対象の最低株価（ボロ株除外。通貨混在のため緩め）
     "min_avg_volume":       100_000,  # 最低平均出来高（流動性確保）
 }
@@ -123,8 +123,8 @@ SCREENING_CONFIG = {
 # ATR（平均日中値幅）を基準に具体価格を算出する。
 TRADE_PLAN_CONFIG = {
     "atr_entry_pullback": 0.5,   # 指値を現値から何ATR離すか（押し目/戻りの深さ）
-    "atr_stop_mult":      2.0,   # 損切りを指値から何ATR離すか
-    "reward_risk_ratio":  2.0,   # 利確 = リスク幅 × この倍率（BUYのみ）
+    "atr_stop_mult":      2.5,   # 損切りを指値から何ATR離すか（Phase8: 2.0→2.5。ノイズでの早期損切りを回避）
+    "reward_risk_ratio":  3.0,   # 利確 = リスク幅 × この倍率（Phase8: 2.0→3.0。勝ちを伸ばす）
 }
 
 # ──────────────────────────────────────────
@@ -187,10 +187,10 @@ SIGNAL_CONFIG = {
 # 保有中の時間切れ手仕舞いを何営業日で行うか（SBI決済注文の期間指定に合わせる）。
 EXIT_CONFIG = {
     "time_stop_days":    15,    # 保有中タイムストップ（営業日）
-    "partial_tp_r":      1.0,   # 第1利確の R 地点
+    "partial_tp_r":      0.8,   # 第1利確の R 地点（Phase8: 1.0→0.8。早めに利を確保し勝率↑・DD↓）
     "partial_tp_pct":    0.5,   # 第1利確で利確する割合
     "move_to_breakeven": True,  # 部分利確後に残りのストップを建値へ
-    "trail_atr_mult":    2.0,   # ATRトレーリングの幅
+    "trail_atr_mult":    1.5,   # ATRトレーリングの幅（Phase8: 2.0→1.5。トレンド時に利益を早く固定）
 }
 
 # ──────────────────────────────────────────
@@ -229,6 +229,27 @@ BACKTEST_CONFIG = {
     "history":                "5y",   # 取得する履歴の期間
     "entry_order_valid_days": 15,     # エントリー注文の有効期限（営業日）
     "max_hold_bars":          20,     # 約定後の最長保有バー数（タイムストップ上限）
-    "slippage_atr":           0.0,    # 約定スリッページ（ATR の倍率。0=なし）
+    "slippage_atr":           0.1,    # 約定スリッページ（ATR の 10%）。アクティブプランは手数料0円だが市場インパクトを想定
+    # 注: SBI アクティブプランは1日100万円以下の約定は手数料0円のため fee_pct=0.0 で問題ない
     "min_abs_score":          0,      # 通知対象の最小絶対スコア（0=フィルタ無効）
+}
+
+# ──────────────────────────────────────────
+# ウォークフォワード最適化設定（Phase 4）
+# ──────────────────────────────────────────
+# is_years + oos_years <= 5（history期間）を守ること。
+# ステップを1年にすると (5 - is_years) 個のウィンドウが生成される。
+OPTIMIZE_CONFIG = {
+    "is_years":   3,      # インサンプル期間（年）
+    "oos_years":  1,      # アウトオブサンプル期間（年）
+    "step_years": 1,      # ウィンドウのスライド幅（年）
+    "objective":  "profit_factor",   # 最大化目標: profit_factor / avg_r / win_rate
+    # 探索するパラメータグリッド
+    # ※ 組み合わせ数 = 各リストの積 → 10〜100 程度に抑えること
+    "param_grid": {
+        "min_abs_score":      [0, 20, 40],     # スコアフィルタ閾値
+        "trail_atr_mult":     [1.5, 2.0, 2.5], # ATRトレーリング幅
+        "partial_tp_r":       [0.8, 1.0, 1.2], # 第1利確 R 地点
+        "breakout_lookback":  [15, 20, 30],    # ブレイクアウト判定期間
+    },
 }
