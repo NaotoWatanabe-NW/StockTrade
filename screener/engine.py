@@ -68,8 +68,8 @@ class StockScreener:
             df_index=df_index,
         )
 
-    def _order(self, context: str, plan):
-        return build_order(context, plan, self.order_config)
+    def _order(self, context: str, plan, market: Market):
+        return build_order(context, plan, self.order_config, market)
 
     def scan_universe(self, codes: list[str]) -> list[dict]:
         """
@@ -138,7 +138,7 @@ class StockScreener:
                 "trade_plan":       d.trade_plan,
                 "suggested_shares": d.shares,
                 "filters":          d.filters,
-                "order":            self._order("ENTRY", d.trade_plan),
+                "order":            self._order("ENTRY", d.trade_plan, market),
             })
 
             score_txt = f"{d.consensus.score:+.0f}" if d.consensus else "-"
@@ -195,7 +195,7 @@ class StockScreener:
                 "score":             d.consensus,
                 "trade_plan":        d.trade_plan,
                 "suggested_shares":  d.shares,
-                "order":             self._order(context, d.trade_plan),
+                "order":             self._order(context, d.trade_plan, market),
             })
 
             if d.signals:
