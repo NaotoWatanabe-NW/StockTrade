@@ -6,9 +6,19 @@ import pytest
 
 from notifier.discord_notifier import (
     DiscordNotifier,
+    _order_field,
+    _order_summary,
     _regime_summary,
     _shares_summary,
 )
+from core.market import US
+from core.orders import build_entry_order
+
+US_ENTRY_PLAN = {
+    "side": "BUY", "entry_kind": "LIMIT",
+    "entry": 100.0, "stop": 95.0, "target": 110.0,
+    "risk_pct": 5.0, "reward_pct": 10.0,
+}
 
 
 # ──────────────────────────────────────────────────────────
@@ -35,6 +45,33 @@ class TestSharesSummary:
 # ──────────────────────────────────────────────────────────
 # _regime_summary
 # ──────────────────────────────────────────────────────────
+
+class TestOrderRendering:
+    """米国株の参考注文(followups)と執行条件が通知に出る。"""
+
+    def test_us_order_field_shows_followups_section(self):
+        order = build_entry_order(US_ENTRY_PLAN, "IFDOCO", is_us=True)
+        field = _order_field(order, US_ENTRY_PLAN, US)
+        value = field["value"]
+        assert "約定後に手動設定" in value
+        assert "利確" in value and "損切り" in value
+
+    def test_us_order_field_shows_exec_conditions(self):
+        order = build_entry_order(US_ENTRY_PLAN, "IFDOCO", is_us=True)
+        value = _order_field(order, US_ENTRY_PLAN, US)["value"]
+        assert "条件なし" in value  # エントリー指値
+        assert "成行" in value      # 損切り逆指値
+
+    def test_us_order_summary_appends_followup_line(self):
+        order = build_entry_order(US_ENTRY_PLAN, "IFDOCO", is_us=True)
+        summary = _order_summary(order, US)
+        assert "約定後:" in summary
+
+    def test_jp_combo_order_has_no_followup_section(self):
+        order = build_entry_order(US_ENTRY_PLAN, "IFDOCO", is_us=False)
+        value = _order_field(order, US_ENTRY_PLAN, US)["value"]
+        assert "約定後に手動設定" not in value
+
 
 class TestRegimeSummary:
     def test_shows_all_passed(self):
@@ -98,6 +135,7 @@ class TestDiscordNotifier:
         order.order_type = "IFDOCO"
         order.legs = []
         order.note = None
+        order.followups = ()
 
         n.notify_screening_result([{
             "code": "7203",

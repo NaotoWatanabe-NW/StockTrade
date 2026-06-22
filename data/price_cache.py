@@ -57,6 +57,11 @@ def _fetch_yfinance(code: str, market: Market, interval: str, years: int) -> Opt
             log.warning(f"yfinance: データなし {code} {interval}")
             return None
         df.columns = [c.lower() for c in df.columns]
+        # 当日の未確定足（close=NaN）はキャッシュに残さない。完成後に再取得される。
+        df = df[df["close"].notna()]
+        if df.empty:
+            log.warning(f"yfinance: 有効な終値なし {code} {interval}")
+            return None
         return df
     except Exception as e:
         log.error(f"yfinance 取得エラー {code} {interval}: {e}")
@@ -112,6 +117,10 @@ def _load_from_db(conn, code: str, interval: str, since: date) -> Optional[pd.Da
     df = pd.DataFrame([dict(r) for r in rows])
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date")
+    # 既存DBに残る終値NULL行（過去の未確定足取り込み分）を除外する。
+    df = df[df["close"].notna()]
+    if df.empty:
+        return None
     return df
 
 

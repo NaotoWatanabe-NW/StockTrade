@@ -62,6 +62,13 @@ class StockDataClient:
                 log.warning(f"データなし: {code}")
                 return None
             df.columns = [c.lower() for c in df.columns]
+            # yfinance は当日の未確定足を close=NaN の行として返すことがある。
+            # これを最新行として使うと現在値が NaN になり含み損益が nan% になるため除去する。
+            if "close" in df.columns:
+                df = df[df["close"].notna()]
+            if df.empty:
+                log.warning(f"有効な終値データなし: {code}")
+                return None
             return df
         except Exception as e:
             log.error(f"取得エラー {code}: {e}")

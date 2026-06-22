@@ -111,3 +111,46 @@ class TestGetHistoryCached:
         with patch("data.price_cache._fetch_yfinance", return_value=None):
             result = get_history_cached(conn, "9999", JP, interval="1d", years=1)
         assert result is None
+
+
+class TestNaNCloseHandling:
+    """当日の未確定足（close=NaN）を保存・返却しないことを検証する。"""
+
+    def test_fetch_drops_trailing_nan_close_row(self, conn):
+        """_fetch_yfinance は close=NaN 行を除いて保存し、有効な足だけ返す。"""
+        import numpy as np
+        idx = pd.bdate_range(str(date.today() - timedelta(days=4)), periods=3)
+        raw = pd.DataFrame(
+            {"Open": [100.0, 101.0, 102.0], "High": [101.0, 102.0, 103.0],
+             "Low": [99.0, 100.0, 101.0], "Close": [100.0, 101.0, np.nan],
+             "Volume": [1000, 1100, 1200]},
+            index=idx,
+        )
+        ticker = MagicMock()
+        ticker.history.return_value = raw
+        with patch("data.price_cache.yf.Ticker", return_value=ticker):
+            result = get_history_cached(conn, "7203", JP, interval="1d", years=1)
+        assert result is not None
+        assert result["close"].notna().all()
+        assert result["close"].iloc[-1] == 101.0   # 未確定足は含まれない
+
+    def test_load_excludes_preexisting_null_close_rows(self, conn):
+        """既にDBに入っている終値NULL行は読み出し時に除外される。"""
+        today = date.today()
+        since = today - timedelta(days=365)
+        conn.execute(
+            "INSERT OR REPLACE INTO price_history (code, interval, date, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)",
+            ("7203", "1d", str(since), 100, 101, 99, 100, 1000),
+        )
+        # 終値 NULL の未確定足が過去に取り込まれていたケース
+        conn.execute(
+            "INSERT OR REPLACE INTO price_history (code, interval, date, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)",
+            ("7203", "1d", str(today), None, None, None, None, 1200),
+        )
+        conn.commit()
+        with patch("data.price_cache._fetch_yfinance") as mock_fetch:
+            result = get_history_cached(conn, "7203", JP, interval="1d", years=1)
+        mock_fetch.assert_not_called()              # キャッシュヒット（最新日=today）
+        assert result is not None
+        assert result["close"].notna().all()         # NULL行は除外
+        assert len(result) == 1

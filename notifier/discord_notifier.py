@@ -27,6 +27,10 @@ def _order_field(order, plan: dict, market) -> Optional[dict]:
     if order is None:
         return None
     lines = [leg.text(market) for leg in order.legs]
+    followups = getattr(order, "followups", ()) or ()
+    if followups:
+        lines.append("─ 約定後に手動設定 ─")
+        lines += [leg.text(market) for leg in followups]
     if plan:
         rr = []
         if plan.get("risk_pct") is not None:
@@ -49,7 +53,12 @@ def _order_summary(order, market) -> str:
     if order is None:
         return ""
     legs = " / ".join(leg.text(market) for leg in order.legs)
-    return f"\n└ [{order.order_type}] {legs}"
+    s = f"\n└ [{order.order_type}] {legs}"
+    followups = getattr(order, "followups", ()) or ()
+    if followups:
+        fu = " / ".join(leg.text(market) for leg in followups)
+        s += f"\n   └ 約定後: {fu}"
+    return s
 
 
 def _score_field(score) -> Optional[dict]:

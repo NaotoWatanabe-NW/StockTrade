@@ -1,6 +1,6 @@
 """core.orders（SBI注文タイプへの組み立て）のテスト"""
 
-from core.market import JP
+from core.market import JP, US
 from core.orders import (
     Leg,
     build_entry_order,
@@ -115,3 +115,82 @@ class TestLegText:
     def test_sell_stop_leg_renders_with_reverse_limit_label(self):
         leg = Leg("SELL", "STOP", 950, "損切り")
         assert leg.text(JP) == "損切り: 売り逆指値 ¥950"
+
+    def test_exec_cond_is_rendered_in_parentheses(self):
+        leg = Leg("SELL", "STOP", 950, "損切り", "成行")
+        assert leg.text(JP) == "損切り: 売り逆指値 ¥950（成行）"
+
+    def test_empty_exec_cond_is_not_rendered(self):
+        leg = Leg("BUY", "LIMIT", 990, "新規買い", "")
+        assert "（" not in leg.text(JP)
+
+
+class TestExecConditions:
+    """指値→「条件なし」、逆指値→「成行」の執行条件が各レッグに付与される。"""
+
+    def test_entry_limit_leg_has_joukennashi(self):
+        order = build_entry_order(BUY_LIMIT_PLAN, "IFDOCO")
+        assert order.legs[0].kind == "LIMIT"
+        assert order.legs[0].exec_cond == "条件なし"
+
+    def test_breakout_entry_stop_leg_has_market_condition(self):
+        order = build_entry_order(BUY_STOP_PLAN, "IFDOCO")
+        assert order.legs[0].kind == "STOP"
+        assert order.legs[0].exec_cond == "成行"
+
+    def test_take_profit_limit_is_joukennashi_and_stop_is_market(self):
+        order = build_entry_order(BUY_LIMIT_PLAN, "IFDOCO")
+        take, stop = order.legs[1], order.legs[2]
+        assert take.role == "利確" and take.exec_cond == "条件なし"
+        assert stop.role == "損切り" and stop.exec_cond == "成行"
+
+    def test_exit_oco_take_is_joukennashi_and_stop_is_market(self):
+        order = build_exit_order(SELL_PLAN, "OCO")
+        take, stop = order.legs[0], order.legs[1]
+        assert take.kind == "LIMIT" and take.exec_cond == "条件なし"
+        assert stop.kind == "STOP" and stop.exec_cond == "成行"
+
+
+class TestUsFallback:
+    """米国株（SBI）は OCO/IFD/IFDOCO 不可 → 単発エントリー＋約定後の参考注文に切替。"""
+
+    def test_us_entry_is_single_leg_regardless_of_ifdoco_setting(self):
+        order = build_entry_order(BUY_LIMIT_PLAN, "IFDOCO", is_us=True)
+        assert order.order_type == "指値"            # 組合せ注文名にしない
+        assert roles(order) == ["新規買い"]           # 発注レッグはエントリーのみ
+
+    def test_us_entry_exposes_stop_and_take_as_followups(self):
+        order = build_entry_order(BUY_LIMIT_PLAN, "IFDOCO", is_us=True)
+        followup_roles = [leg.role for leg in order.followups]
+        assert followup_roles == ["利確", "損切り"]
+        assert all(leg.side == "SELL" for leg in order.followups)
+
+    def test_us_breakout_entry_uses_stop_label(self):
+        order = build_entry_order(BUY_STOP_PLAN, "IFDOCO", is_us=True)
+        assert order.order_type == "逆指値"
+
+    def test_us_entry_without_target_only_has_stop_followup(self):
+        plan = {**BUY_LIMIT_PLAN, "target": None}
+        order = build_entry_order(plan, "IFDOCO", is_us=True)
+        assert [leg.role for leg in order.followups] == ["損切り"]
+
+    def test_us_exit_uses_stop_as_main_and_take_as_followup(self):
+        order = build_exit_order(SELL_PLAN, "OCO", is_us=True)
+        assert order.order_type == "逆指値"
+        assert roles(order) == ["損切り/撤退"]
+        assert [leg.role for leg in order.followups] == ["利確/戻り売り"]
+
+    def test_build_order_routes_us_entry_to_single_order(self):
+        order = build_order("ENTRY", BUY_LIMIT_PLAN, ORDER_CFG, market=US)
+        assert order.order_type == "指値"
+        assert order.followups  # 参考注文が併記される
+
+    def test_build_order_jp_entry_keeps_ifdoco(self):
+        order = build_order("ENTRY", BUY_LIMIT_PLAN, ORDER_CFG, market=JP)
+        assert order.order_type == "IFDOCO"
+        assert order.followups == ()
+
+    def test_build_order_without_market_defaults_to_combo(self):
+        # 後方互換: market 未指定は日本株扱い（従来どおり組合せ注文）
+        order = build_order("ENTRY", BUY_LIMIT_PLAN, ORDER_CFG)
+        assert order.order_type == "IFDOCO"
