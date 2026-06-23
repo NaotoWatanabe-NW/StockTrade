@@ -11,7 +11,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import holdings, trades, pnl, backtest, portfolio, signals
+from api.routers import holdings, trades, pnl, backtest, portfolio, signals, watchlist
 
 app = FastAPI(title="StockTrade API", version="1.0")
 
@@ -30,6 +30,7 @@ app.include_router(pnl.router)
 app.include_router(backtest.router)
 app.include_router(portfolio.router)
 app.include_router(signals.router)
+app.include_router(watchlist.router)
 
 
 @app.get("/api/health", tags=["health"])

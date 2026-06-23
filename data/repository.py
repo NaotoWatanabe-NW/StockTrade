@@ -187,6 +187,65 @@ def sync_holding_from_trades(conn: sqlite3.Connection, code: str) -> None:
     conn.commit()
 
 
+# ── watchlist ────────────────────────────────────────────────
+
+def _watchlist_row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id":         row["id"],
+        "code":       row["code"],
+        "name":       row["name"],
+        "market":     row["market"],
+        "note":       row["note"],
+        "created_at": row["created_at"],
+    }
+
+
+def list_watchlist(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute("SELECT * FROM watchlist ORDER BY code").fetchall()
+    return [_watchlist_row_to_dict(r) for r in rows]
+
+
+def get_watchlist_item(conn: sqlite3.Connection, code: str) -> dict | None:
+    row = conn.execute("SELECT * FROM watchlist WHERE code = ?", (code,)).fetchone()
+    return _watchlist_row_to_dict(row) if row else None
+
+
+def upsert_watchlist(
+    conn: sqlite3.Connection,
+    code: str,
+    name: str | None = None,
+    market: str | None = None,
+    note: str | None = None,
+) -> dict:
+    conn.execute(
+        """
+        INSERT INTO watchlist (code, name, market, note)
+        VALUES (:code, :name, :market, :note)
+        ON CONFLICT(code) DO UPDATE SET
+            name   = excluded.name,
+            market = excluded.market,
+            note   = excluded.note
+        """,
+        {"code": code, "name": name, "market": market, "note": note},
+    )
+    conn.commit()
+    return get_watchlist_item(conn, code)
+
+
+def delete_watchlist_item(conn: sqlite3.Connection, code: str) -> bool:
+    cur = conn.execute("DELETE FROM watchlist WHERE code = ?", (code,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def watchlist_codes(conn: sqlite3.Connection) -> list[str]:
+    """スクリーニング用にコードだけ返す"""
+    rows = conn.execute("SELECT code FROM watchlist ORDER BY code").fetchall()
+    return [r["code"] for r in rows]
+
+
+# ── pnl ─────────────────────────────────────────────────────
+
 def realized_pnl(conn: sqlite3.Connection) -> list[dict]:
     """銘柄ごとの実現損益を平均取得単価ベースで集計する。
 

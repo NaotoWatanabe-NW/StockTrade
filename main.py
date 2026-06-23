@@ -100,7 +100,7 @@ def run_once(screener: StockScreener, notifier: DiscordNotifier, markets: set[st
         log.info("保有銘柄が未登録です（Webアプリ、または scripts/migrate_holdings で登録）")
 
     # ── 2. スクリーニング ─────────────────────────────
-    universe = _filter_by_market(config.SCREENING_UNIVERSE, markets)
+    universe = _filter_by_market(config.get_screening_universe(), markets)
     log.info(f"スクリーニング中（{len(universe)}銘柄）...")
     results = screener.scan_universe(universe)
     log.info(f"✅ {len(results)}銘柄でシグナル検出")

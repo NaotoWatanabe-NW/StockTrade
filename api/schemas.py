@@ -46,6 +46,18 @@ class PnlRow(BaseModel):
     realized: float
 
 
+class WatchlistIn(BaseModel):
+    code: str
+    name: Optional[str] = None
+    market: Optional[str] = None
+    note: Optional[str] = None
+
+
+class WatchlistOut(WatchlistIn):
+    id: int
+    created_at: str
+
+
 class BacktestRunOut(BaseModel):
     id: int
     run_at: str

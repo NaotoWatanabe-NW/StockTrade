@@ -86,6 +86,20 @@ class TestScanUniverse:
         screener = make_screener({"9999": cheap})
         assert screener.scan_universe(["9999"]) == []
 
+    def test_us_stock_under_yen_floor_but_above_dollar_floor_is_included(self):
+        # 米国株は min_price_us（ドル）で判定するため、¥300未満相当の$55でも対象になる。
+        us = ohlcv([50.0] * 29 + [55.0])
+        screener = make_screener({"AAPL": us}, {"AAPL": {"name": "Apple"}})
+        results = screener.scan_universe(["AAPL"])
+        assert len(results) == 1
+        assert results[0]["market"].code == "US"
+
+    def test_us_penny_stock_below_dollar_floor_is_excluded(self):
+        # $5未満のペニー株は米国フロアで除外される。
+        penny = ohlcv([3.0] * 29 + [4.5])
+        screener = make_screener({"XYZ": penny})
+        assert screener.scan_universe(["XYZ"]) == []
+
     def test_illiquid_stock_is_excluded(self):
         thin = ohlcv([1000.0] * 29 + [1100.0], volume=1_000)  # 出来高不足
         screener = make_screener({"7203": thin})

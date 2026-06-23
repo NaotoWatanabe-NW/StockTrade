@@ -27,6 +27,15 @@ export type Trade = {
   note?: string | null;
 };
 
+export type WatchlistItem = {
+  id?: number;
+  code: string;
+  name?: string | null;
+  market?: string | null;
+  note?: string | null;
+  created_at?: string;
+};
+
 export type PnlRow = {
   code: string;
   name?: string | null;
@@ -87,6 +96,14 @@ export const deleteTrade = (id: number) =>
   req<{ deleted: number }>(`/api/trades/${id}`, { method: "DELETE" });
 
 export const getPnl = () => req<PnlRow[]>("/api/pnl");
+
+export const getWatchlist = () => req<WatchlistItem[]>("/api/watchlist");
+export const upsertWatchlistItem = (item: WatchlistItem) =>
+  req<WatchlistItem>("/api/watchlist", { method: "POST", body: JSON.stringify(item) });
+export const deleteWatchlistItem = (code: string) =>
+  req<{ deleted: string }>(`/api/watchlist/${encodeURIComponent(code)}`, {
+    method: "DELETE",
+  });
 
 export type BacktestRun = {
   id: number;

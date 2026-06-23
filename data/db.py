@@ -89,6 +89,17 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
 CREATE INDEX IF NOT EXISTS idx_signals_code   ON signals(code);
 
+CREATE TABLE IF NOT EXISTS watchlist (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    code       TEXT    NOT NULL UNIQUE,
+    name       TEXT,
+    market     TEXT,                          -- "JP"/"US"/NULL(自動判定)
+    note       TEXT,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_watchlist_code ON watchlist(code);
+
 CREATE TABLE IF NOT EXISTS backtest_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     run_at          TEXT    NOT NULL DEFAULT (datetime('now')),  -- 実行日時 ISO

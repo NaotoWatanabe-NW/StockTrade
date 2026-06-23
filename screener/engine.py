@@ -100,7 +100,10 @@ class StockScreener:
                 continue
 
             # 流動性・最低株価フィルター（ボロ株・低流動性を除外）
-            if d.price < self.config["min_price"]:
+            # 最低株価は通貨が異なるため市場別（日本株=円, 米国株=ドル）に判定する。
+            min_price = (self.config.get("min_price_us", 5)
+                         if market.code == "US" else self.config["min_price"])
+            if d.price < min_price:
                 continue
             if d.avg_volume < self.config["min_avg_volume"]:
                 continue
