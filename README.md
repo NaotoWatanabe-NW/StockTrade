@@ -24,18 +24,50 @@ Discordに通知
 
 ```
 StockTrade/
-├── config.py                    # 保有銘柄・監視銘柄・閾値・注文プラン設定
-├── main.py                      # メイン実行スクリプト
+├── config.py                    # 保有取得・監視銘柄・閾値・注文プラン設定
+├── main.py                      # メイン実行スクリプト（監視＋スクリーニング）
 ├── requirements.txt             # 依存パッケージ
+├── stock.db                     # SQLite（保有・約定・シグナル履歴・価格キャッシュ）
+├── run_monitor.sh               # 監視の定期実行ランナー（cron用）
+├── run_idle_check.sh            # 寝ている資産チェックの定期実行ランナー（cron用）
+├── run_web.sh                   # Webアプリ（API＋フロント）起動ランナー
 ├── core/
 │   ├── data_client.py           # yfinanceクライアント（日本/米国対応）
 │   ├── market.py                # 市場判定（東証/米国・通貨・取引時間）
 │   ├── indicators.py            # テクニカル指標・シグナル判定
-│   └── trade_plan.py            # 指値・損切り・利確の算出
+│   ├── scoring.py               # 合議制スコアリング（複数指標の重み付き合算）
+│   ├── strategy.py              # 1銘柄の総合評価（シグナル→方向→プラン）
+│   ├── trade_plan.py            # 指値・損切り・利確の算出（ATR基準）
+│   ├── orders.py                # SBI注文タイプ（指値/逆指値/OCO/IFD/IFDOCO）組立
+│   ├── exit_rules.py            # 保有ロングの手仕舞いルール
+│   ├── risk.py                  # ポジションサイジング
+│   ├── regime.py                # 相場レジーム判定（トレンド/チョップ）
+│   └── events.py                # 決算回避フィルタ
 ├── screener/
-│   └── engine.py                # スクリーニング＋保有損益エンジン
-└── notifier/
-    └── discord_notifier.py      # Discord通知
+│   ├── engine.py                # スクリーニング＋保有損益エンジン
+│   └── signal_log.py            # シグナル履歴の記録
+├── notifier/
+│   └── discord_notifier.py      # Discord通知
+├── data/
+│   ├── db.py                    # SQLite接続・スキーマ
+│   ├── repository.py            # holdings/trades などCRUD
+│   └── price_cache.py           # 価格データのキャッシュ
+├── scripts/
+│   ├── migrate_holdings.py      # 旧 holdings_local.py → DB 移行（初回のみ）
+│   ├── migrate_watchlist.py     # 監視ユニバース → DB 移行（初回のみ）
+│   └── notify_idle_holdings.py  # 寝ている資産を検出してDiscord通知
+├── backtest/
+│   ├── runner.py                # バックテスト実行
+│   ├── simulator.py             # 約定シミュレーション
+│   ├── metrics.py               # 成績指標の算出
+│   └── optimizer.py             # パラメータ最適化
+├── api/                         # FastAPIバックエンド（取引記録Webアプリ）
+│   ├── main.py / deps.py / schemas.py
+│   └── routers/                 # holdings/trades/pnl/portfolio/signals/watchlist/backtest
+└── web/                         # フロントエンド（Next.js + TypeScript）
+    ├── app/                     # 画面（ダッシュボード/保有/取引/損益）
+    ├── components/              # UIコンポーネント
+    └── lib/                     # APIクライアント
 ```
 
 ---
@@ -69,25 +101,21 @@ python3 -m venv .venv
 
 ### 3. 保有銘柄（口座情報）の登録
 
-実際の保有銘柄は `holdings_local.py`（**git管理外**）に書きます。
-テンプレートをコピーして編集してください:
+保有銘柄は SQLite（`stock.db`）で管理します。`config.py` の `get_holdings()` が
+定期実行のたびに DB から最新を読むため、**Webアプリで編集した内容が監視ツールに即反映**されます。
 
-```bash
-cp holdings_local.example.py holdings_local.py
-```
+- **登録・編集**: 後述の「取引記録 Web アプリ」の保有銘柄画面から操作（推奨）
+- **旧形式からの移行**: かつて `holdings_local.py` に書いていた場合は、1回だけ実行して取り込めます
 
-```python
-# holdings_local.py
-HOLDINGS = [
-    # 東証は証券コード、米国はティッカー。市場は自動判定（明示も可: market="US"）
-    {"code": "7203", "name": "トヨタ自動車", "avg_price": 2800, "shares": 100},
-    {"code": "AAPL", "name": "Apple",        "avg_price": 180,  "shares": 10},
-]
-```
+  ```bash
+  .venv/bin/python -m scripts.migrate_holdings
+  ```
+
+各銘柄が持つ項目:
 
 - `avg_price`（建値）→ 含み損益率を計算
 - `shares`（保有株数）→ 含み損益を**金額でも**表示
-- `holdings_local.py` があれば `config.py` の `HOLDINGS` を自動で上書きします
+- `long_term`（長期保有フラグ）→ 寝ている資産の売却候補抽出（後述）から除外
 
 ### 4. スクリーニング対象の調整（任意）
 
@@ -114,6 +142,31 @@ cron で回す場合は同梱の `run_monitor.sh` を使う:
 ```cron
 # 平日 9:30 と 15:30 に1回ずつ実行
 30 9,15 * * 1-5 /path/to/StockTrade/run_monitor.sh >> /path/to/StockTrade/cron.log 2>&1
+```
+
+### 寝ている資産（塩漬け）の抽出・通知
+
+スイングでは「1日の値動き（ATR）が小さい銘柄」は値幅を取れず資金が寝る。
+`notify_idle_holdings` は、**長期保有フラグ(`long_term`)を除いた保有**のうち
+ATR%/日が閾値未満の銘柄を抽出し、戻り売り指値・撤退逆指値を付けて Discord に通知する。
+
+```bash
+.venv/bin/python -m scripts.notify_idle_holdings              # 通知を送信
+.venv/bin/python -m scripts.notify_idle_holdings --dry-run    # 送信せず内容を表示
+.venv/bin/python -m scripts.notify_idle_holdings --atr-max 1.5  # 閾値（%/日）を変更
+```
+
+| オプション | 意味 | 既定 |
+| --- | --- | --- |
+| `--atr-max` | 寝ている判定とする ATR%/日 の上限 | `2.0` |
+| `--include-long-term` | 長期保有フラグの銘柄も対象に含める | 除外 |
+| `--dry-run` | Discordに送らずコンソール表示のみ | 送信する |
+
+cron で回す場合は同梱の `run_idle_check.sh` を使う（引数はそのまま透過）:
+
+```cron
+# 毎週月曜 8:00 に1回（場中前に売却候補を確認）
+0 8 * * 1 /path/to/StockTrade/run_idle_check.sh >> /path/to/StockTrade/cron.log 2>&1
 ```
 
 ---
