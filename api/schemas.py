@@ -46,6 +46,20 @@ class PnlRow(BaseModel):
     realized: float
 
 
+class PnlSummaryRow(BaseModel):
+    currency: str
+    label: str
+    realized: float            # 税引前の実現損益合計
+    tax: float                 # 税額（利益>0のときのみ課税）
+    realized_after_tax: float  # 税引後の実現損益合計
+    tax_rate: float
+
+
+class PnlResponse(BaseModel):
+    rows: list[PnlRow]
+    summary: list[PnlSummaryRow]
+
+
 class WatchlistIn(BaseModel):
     code: str
     name: Optional[str] = None

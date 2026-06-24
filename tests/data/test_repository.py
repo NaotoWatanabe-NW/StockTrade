@@ -13,6 +13,7 @@ from data.repository import (
     save_signal, get_signal, list_signals, update_signal_status,
     exists_open_signal_today, expire_stale_signals, signal_attribution,
     _on_signal_trade_change, save_backtest_run,
+    realized_pnl_summary,
 )
 
 
@@ -140,6 +141,35 @@ class TestRealizedPnl:
         pnl = realized_pnl(conn)[0]
         assert pnl["realized"] == 0
         assert pnl["remaining_shares"] == 100
+
+
+class TestRealizedPnlSummary:
+    def test_taxes_only_net_profit_after_offsetting_losses(self):
+        # 同一通貨グループ内で利益銘柄と損失銘柄を損益通算してから課税する
+        rows = [
+            {"code": "7203", "realized": 30_000},   # 利益
+            {"code": "6758", "realized": -10_000},  # 損失
+        ]
+        jp = next(s for s in realized_pnl_summary(rows, 0.20315) if s["currency"] == "JPY")
+        assert jp["realized"] == 20_000             # 30,000 - 10,000（損益通算後）
+        assert jp["tax"] == pytest.approx(20_000 * 0.20315)
+        assert jp["realized_after_tax"] == pytest.approx(20_000 - 20_000 * 0.20315)
+
+    def test_separates_jp_and_us_currency_groups(self):
+        rows = [
+            {"code": "7203", "realized": 10_000},   # 日本株
+            {"code": "AAPL", "realized": 200},      # 米国株
+        ]
+        summary = {s["currency"]: s for s in realized_pnl_summary(rows, 0.20315)}
+        assert summary["JPY"]["realized"] == 10_000
+        assert summary["USD"]["realized"] == 200
+        assert summary["USD"]["tax"] == pytest.approx(200 * 0.20315)
+
+    def test_net_loss_group_is_not_taxed(self):
+        rows = [{"code": "7203", "realized": -5_000}]
+        jp = next(s for s in realized_pnl_summary(rows, 0.20315) if s["currency"] == "JPY")
+        assert jp["tax"] == 0
+        assert jp["realized_after_tax"] == -5_000
 
 
 class TestBacktestRunRepository:

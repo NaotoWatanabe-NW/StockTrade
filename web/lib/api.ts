@@ -49,6 +49,20 @@ export type PnlRow = {
   realized: number;
 };
 
+export type PnlSummaryRow = {
+  currency: string;
+  label: string;
+  realized: number;
+  tax: number;
+  realized_after_tax: number;
+  tax_rate: number;
+};
+
+export type PnlResponse = {
+  rows: PnlRow[];
+  summary: PnlSummaryRow[];
+};
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
@@ -95,7 +109,7 @@ export const addTrade = (t: Trade) =>
 export const deleteTrade = (id: number) =>
   req<{ deleted: number }>(`/api/trades/${id}`, { method: "DELETE" });
 
-export const getPnl = () => req<PnlRow[]>("/api/pnl");
+export const getPnl = () => req<PnlResponse>("/api/pnl");
 
 export const getWatchlist = () => req<WatchlistItem[]>("/api/watchlist");
 export const upsertWatchlistItem = (item: WatchlistItem) =>

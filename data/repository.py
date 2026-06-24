@@ -5,6 +5,7 @@ holdings / trades のデータアクセス層（CRUD）
 返り値は素の dict で、screener.engine がそのまま扱える形にする。
 """
 
+import re
 import sqlite3
 from typing import Optional
 
@@ -288,6 +289,41 @@ def realized_pnl(conn: sqlite3.Connection) -> list[dict]:
             "sell_amount": r["sell_amount"] or 0,
             "fee_total": r["fee_total"] or 0,
             "realized": realized,
+        })
+    return result
+
+
+def _is_jp_code(code: str) -> bool:
+    """東証コード（数字のみ）なら日本株、英字を含めば米国株。"""
+    return bool(re.fullmatch(r"[0-9.]+", code or ""))
+
+
+def realized_pnl_summary(rows: list[dict], tax_rate: float) -> list[dict]:
+    """realized_pnl の行を通貨グループ（日本株/米国株）ごとに集計し、税額を算出する。
+
+    日本株は円、米国株はドルと通貨が異なるためグループを分ける。
+    税額は損益通算後の純利益が正のときだけ課税される（利益 × tax_rate）。
+    損失グループの税額は 0。
+    """
+    groups = {
+        "JPY": {"currency": "JPY", "label": "日本株", "realized": 0.0},
+        "USD": {"currency": "USD", "label": "米国株", "realized": 0.0},
+    }
+    for r in rows:
+        key = "JPY" if _is_jp_code(r["code"]) else "USD"
+        groups[key]["realized"] += r["realized"]
+
+    result = []
+    for g in groups.values():
+        gross = g["realized"]
+        tax = gross * tax_rate if gross > 0 else 0.0
+        result.append({
+            "currency": g["currency"],
+            "label": g["label"],
+            "realized": gross,
+            "tax": tax,
+            "realized_after_tax": gross - tax,
+            "tax_rate": tax_rate,
         })
     return result
 

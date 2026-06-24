@@ -74,11 +74,32 @@ class TestTradesApi:
 
 class TestPnlApi:
     def test_realized_pnl_reflects_trades(self, client):
-        client.post("/api/trades", json={"code": "X", "side": "BUY", "shares": 100, "price": 1000, "traded_at": "2026-01-01"})
-        client.post("/api/trades", json={"code": "X", "side": "SELL", "shares": 100, "price": 1500, "traded_at": "2026-03-01"})
+        client.post("/api/trades", json={"code": "7203", "side": "BUY", "shares": 100, "price": 1000, "traded_at": "2026-01-01"})
+        client.post("/api/trades", json={"code": "7203", "side": "SELL", "shares": 100, "price": 1500, "traded_at": "2026-03-01"})
         pnl = client.get("/api/pnl").json()
-        assert pnl[0]["code"] == "X"
-        assert pnl[0]["realized"] == 50_000   # (1500-1000)*100
+        assert pnl["rows"][0]["code"] == "7203"
+        assert pnl["rows"][0]["realized"] == 50_000   # (1500-1000)*100
+
+    def test_summary_applies_capital_gains_tax_to_profit(self, client):
+        from config import TAX_CONFIG
+
+        client.post("/api/trades", json={"code": "7203", "side": "BUY", "shares": 100, "price": 1000, "traded_at": "2026-01-01"})
+        client.post("/api/trades", json={"code": "7203", "side": "SELL", "shares": 100, "price": 1500, "traded_at": "2026-03-01"})
+        summary = client.get("/api/pnl").json()["summary"]
+        jp = next(s for s in summary if s["currency"] == "JPY")
+        rate = TAX_CONFIG["capital_gains_rate"]
+        assert jp["realized"] == 50_000
+        assert jp["tax"] == 50_000 * rate
+        assert jp["realized_after_tax"] == 50_000 - 50_000 * rate
+
+    def test_summary_does_not_tax_a_loss(self, client):
+        client.post("/api/trades", json={"code": "7203", "side": "BUY", "shares": 100, "price": 1500, "traded_at": "2026-01-01"})
+        client.post("/api/trades", json={"code": "7203", "side": "SELL", "shares": 100, "price": 1000, "traded_at": "2026-03-01"})
+        summary = client.get("/api/pnl").json()["summary"]
+        jp = next(s for s in summary if s["currency"] == "JPY")
+        assert jp["realized"] == -50_000
+        assert jp["tax"] == 0
+        assert jp["realized_after_tax"] == -50_000
 
 
 class TestBacktestApi:

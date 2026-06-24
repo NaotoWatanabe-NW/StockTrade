@@ -1,48 +1,58 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { PnlRow, getPnl, fmtPrice, isJP } from "@/lib/api";
+import { PnlRow, PnlSummaryRow, getPnl, fmtPrice } from "@/lib/api";
+
+function fmtMoney(currency: string, value: number): string {
+  if (currency === "JPY") return `¥${Math.round(value).toLocaleString()}`;
+  return `$${value.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
 
 export default function PnlPage() {
   const [rows, setRows] = useState<PnlRow[]>([]);
+  const [summary, setSummary] = useState<PnlSummaryRow[]>([]);
   const [error, setError] = useState("");
 
   useEffect(() => {
     getPnl()
-      .then(setRows)
+      .then((res) => {
+        setRows(res.rows);
+        setSummary(res.summary);
+      })
       .catch((e) => setError(String(e)));
   }, []);
 
-  const jpTotal = rows
-    .filter((r) => isJP(r.code))
-    .reduce((s, r) => s + r.realized, 0);
-  const usTotal = rows
-    .filter((r) => !isJP(r.code))
-    .reduce((s, r) => s + r.realized, 0);
+  const taxRate = summary[0]?.tax_rate ?? 0;
 
   return (
     <div>
       <h1>実現損益</h1>
       <p className="muted">
         約定履歴ベース。実現損益 = 売却額 − 平均取得単価 × 売却株数 − 手数料。
+        税金は譲渡益課税（{(taxRate * 100).toFixed(3)}%）を、通貨グループごとの
+        損益通算後の純利益に課税して算出しています（利益が出た場合のみ）。
         通貨が異なるため日本株・米国株は別集計です。
       </p>
 
       {error && <div className="error">{error}</div>}
 
       <div className="cards" style={{ marginBottom: 20 }}>
-        <div className="panel card">
-          <div className="label">日本株 実現損益合計</div>
-          <div className={`value ${jpTotal >= 0 ? "pos" : "neg"}`}>
-            ¥{Math.round(jpTotal).toLocaleString()}
+        {summary.map((s) => (
+          <div className="panel card" key={s.currency}>
+            <div className="label">{s.label} 実現損益</div>
+            <div className={`value ${s.realized >= 0 ? "pos" : "neg"}`}>
+              {fmtMoney(s.currency, s.realized)}
+            </div>
+            <div className="muted" style={{ marginTop: 6, fontSize: "0.85em" }}>
+              税金: −{fmtMoney(s.currency, s.tax)}
+              <br />
+              税引後: {fmtMoney(s.currency, s.realized_after_tax)}
+            </div>
           </div>
-        </div>
-        <div className="panel card">
-          <div className="label">米国株 実現損益合計</div>
-          <div className={`value ${usTotal >= 0 ? "pos" : "neg"}`}>
-            ${usTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-          </div>
-        </div>
+        ))}
       </div>
 
       <div className="panel">
@@ -55,7 +65,7 @@ export default function PnlPage() {
               <th className="num">売却株</th>
               <th className="num">残株</th>
               <th className="num">平均取得単価</th>
-              <th className="num">実現損益</th>
+              <th className="num">実現損益（税引前）</th>
             </tr>
           </thead>
           <tbody>
