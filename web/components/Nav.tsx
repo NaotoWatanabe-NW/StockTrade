@@ -11,6 +11,7 @@ export default function Nav() {
       <Link href="/pnl">損益</Link>
       <Link href="/signals">シグナル</Link>
       <Link href="/backtest">バックテスト</Link>
+      <Link href="/settings">設定</Link>
     </nav>
   );
 }

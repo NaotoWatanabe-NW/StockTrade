@@ -104,24 +104,43 @@ def run_once(screener: StockScreener, notifier: DiscordNotifier, markets: set[st
     log.info(f"スクリーニング中（{len(universe)}銘柄）...")
     results = screener.scan_universe(universe)
     log.info(f"✅ {len(results)}銘柄でシグナル検出")
+    for r in results:
+        plan = r.get("trade_plan")
+        market = r["market"]
+        score_txt = f"{r['score'].score:+.0f}" if r.get("score") else "-"
+        if plan:
+            log.info(
+                f"  📌 {r['name']}（{r['code']}）score {score_txt}"
+                f" | {plan['entry_kind']} {market.fmt(plan['entry'])}"
+                f" / 損切 {market.fmt(plan['stop'])}"
+                f" / 利確 {market.fmt(plan['target'])}"
+                f" (リスク -{plan['risk_pct']:.1f}% / リワード +{plan['reward_pct']:.1f}%)"
+            )
     notifier.notify_screening_result(results)
 
     # ── 3. シグナルをDBに記録（実取引フィードバック用） ──
-    _persist_signals(results)
+    _persist_signals(results, notifier)
 
     log.info("📊 チェック完了\n")
 
 
-def _persist_signals(results: list[dict]) -> None:
-    """スキャン結果を signals テーブルに保存する（失敗しても監視は止めない）。"""
+def _persist_signals(results: list[dict], notifier: DiscordNotifier | None = None) -> None:
+    """スキャン結果を signals テーブルに保存する（失敗しても監視は止めない）。
+
+    NOTIFY_CONFIG['per_signal_tracking'] が有効なら、新規 OPEN シグナルを1件ずつ
+    個別通知して Discord メッセージID を保存する（双方向Bot のリアクション用）。
+    """
     try:
         from data.db import get_connection
-        from data.repository import expire_stale_signals
-        from screener.signal_log import record_scan_signals
+        from data.repository import expire_stale_signals, signals_pending_notification
+        from screener.signal_log import record_scan_signals, notify_and_link_signal
         conn = get_connection()
         try:
             expire_stale_signals(conn, config.BACKTEST_CONFIG.get("entry_order_valid_days", 15))
             record_scan_signals(conn, results)
+            if notifier and config.NOTIFY_CONFIG.get("per_signal_tracking", False):
+                for sig in signals_pending_notification(conn):
+                    notify_and_link_signal(conn, notifier, sig)
         finally:
             conn.close()
     except Exception as e:
@@ -150,20 +169,22 @@ def main():
         raise SystemExit(0 if ok else 1)
 
     client   = StockDataClient(rate_limit_sec=1.0)
+    # config getter 経由で読むことで、Webで編集した永続パラメータが即反映される。
+    risk_config = config.get_risk_config()
     screener = StockScreener(
         client,
-        config.SCREENING_CONFIG,
-        config.TRADE_PLAN_CONFIG,
+        config.get_screening_config(),
+        config.get_trade_plan_config(),
         config.ORDER_CONFIG,
-        scoring_config=config.SCORING_CONFIG,
-        risk_config=config.RISK_CONFIG,       # Phase 2: 推奨株数サイジング
-        regime_config=config.REGIME_CONFIG,   # Phase 3: 週足/指数/ADX フィルタ
+        scoring_config=config.get_scoring_config(),
+        risk_config=risk_config,              # Phase 2: 推奨株数サイジング
+        regime_config=config.get_regime_config(),  # Phase 3: 週足/指数/ADX フィルタ
         events_config=config.EVENTS_CONFIG,   # Phase 3: 決算回避フィルタ
     )
 
     holdings_count = len(config.get_holdings())
     notifier.notify_startup(holdings_count, len(config.SCREENING_UNIVERSE),
-                            risk_config=config.RISK_CONFIG)
+                            risk_config=risk_config)
 
     if not args.loop:
         run_once(screener, notifier)  # 単発は全市場をスキャン

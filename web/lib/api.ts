@@ -25,6 +25,7 @@ export type Trade = {
   fee: number;
   traded_at: string; // YYYY-MM-DD
   note?: string | null;
+  signal_id?: number | null; // 紐付くシグナル（予測ベース注文）。null=単独注文
 };
 
 export type WatchlistItem = {
@@ -136,6 +137,16 @@ export type BacktestRun = {
   sharpe?: number | null;
   annual_return_pct?: number | null;
   equity_curve?: string | null;  // JSON 文字列 → parse して使う
+  status: string;                // running / done / error
+  error?: string | null;
+};
+
+export type BacktestRunRequest = {
+  universe: string;              // "JP" / "US" / "ALL"
+  regime: boolean;               // レジームフィルタ
+  no_partial_tp: boolean;        // 部分利確を無効化
+  min_score?: number | null;     // スコア絶対値フィルタ
+  params: Record<string, number | boolean>; // 個別パラメータ上書き
 };
 
 export type EquityPoint = { date: string; equity: number };
@@ -154,8 +165,45 @@ export const getBacktestRuns = (limit = 20) =>
 export const getBacktestRun = (id: number) =>
   req<BacktestRun>(`/api/backtest/${id}`);
 
+export const getBacktestDefaults = () =>
+  req<Record<string, number | boolean>>("/api/backtest/defaults");
+
+export const runBacktest = (body: BacktestRunRequest) =>
+  req<BacktestRun>("/api/backtest/run", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
 export const getPortfolioHeat = () =>
   req<PortfolioHeat>("/api/portfolio/heat");
+
+export type SizingSuggestion = {
+  signal_id: number;
+  code: string;
+  name?: string | null;
+  market?: string | null;
+  score?: number | null;
+  entry_price?: number | null;
+  stop_price?: number | null;
+  target_price?: number | null;
+  lot_size: number;
+  suggested_shares: number;
+  investment: number;
+  risk_amount: number;
+};
+
+export type SizingResponse = {
+  account_size: number;
+  risk_per_trade_pct: number;
+  max_positions: number;
+  open_positions: number;
+  remaining_slots: number;
+  heat_pct: number;
+  suggestions: SizingSuggestion[];
+};
+
+export const getSizingSuggestions = () =>
+  req<SizingResponse>("/api/portfolio/suggestions");
 
 export type SignalStatus = "OPEN" | "TAKEN" | "CLOSED" | "SKIPPED" | "EXPIRED";
 
@@ -177,6 +225,20 @@ export type Signal = {
   status: SignalStatus;
   realized_r?: number | null;
   notes?: string | null;
+  // 紐付く約定(trades)の集計（建玉状況の表示用）
+  filled_shares: number;
+  sold_shares: number;
+  avg_fill_price?: number | null;
+  avg_sell_price?: number | null;
+  remaining_shares: number;
+  position_value?: number | null;
+};
+
+export type SignalFill = {
+  shares: number;
+  price: number;
+  traded_at: string; // YYYY-MM-DD
+  fee?: number;
 };
 
 export type SignalAttribution = {
@@ -206,8 +268,62 @@ export const setSignalStatus = (id: number, status: SignalStatus) =>
     body: JSON.stringify({ status }),
   });
 
+export const signalFill = (id: number, body: SignalFill) =>
+  req<Signal>(`/api/signals/${id}/fill`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const signalClose = (id: number, body: SignalFill) =>
+  req<Signal>(`/api/signals/${id}/close`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const getSignalTrades = (id: number) =>
+  req<Trade[]>(`/api/signals/${id}/trades`);
+
 export const getSignalAttribution = () =>
   req<SignalAttribution>("/api/signals/attribution");
+
+export type ScoreCalibrationBucket = {
+  score_lo: number;
+  score_hi: number;
+  n_signals: number;
+  n_entered: number;
+  entry_rate?: number | null;
+  n_target: number;
+  n_stop: number;
+  n_timeout: number;
+  win_rate?: number | null;
+  avg_r?: number | null;
+  avg_mfe_r?: number | null;
+};
+
+export const getSignalCalibration = () =>
+  req<ScoreCalibrationBucket[]>("/api/signals/calibration");
+
+// ── 調整可能パラメータ（設定） ──────────────────────
+export type SettingItem = {
+  param: string;
+  section: string;
+  value: number | boolean;
+  default: number | boolean;
+  overridden: boolean;
+};
+
+export const getSettings = () => req<SettingItem[]>("/api/settings");
+
+export const updateSettings = (values: Record<string, number | boolean>) =>
+  req<SettingItem[]>("/api/settings", {
+    method: "PUT",
+    body: JSON.stringify({ values }),
+  });
+
+export const resetSetting = (param: string) =>
+  req<SettingItem[]>(`/api/settings/${encodeURIComponent(param)}`, {
+    method: "DELETE",
+  });
 
 // ── 表示ヘルパー（市場・通貨） ──────────────────────
 export function isJP(code: string): boolean {

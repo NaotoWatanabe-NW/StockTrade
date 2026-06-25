@@ -83,11 +83,43 @@ CREATE TABLE IF NOT EXISTS signals (
     order_type    TEXT,                        -- "IFDOCO" など
     status        TEXT    NOT NULL DEFAULT 'OPEN',
     realized_r    REAL,                        -- 決済完了後に計算した実現R
-    notes         TEXT
+    notes         TEXT,
+    discord_message_id TEXT                    -- 個別通知のDiscordメッセージID（リアクション双方向用）
 );
 
 CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
 CREATE INDEX IF NOT EXISTS idx_signals_code   ON signals(code);
+
+-- シグナルの「予測（計画 entry/stop/target）」に対する実勢価格の結果。
+-- 実際に取引したかに依存せず、シグナル自体の的中度を測りキャリブレーション
+-- （score → 勝率/期待R）に使う。1シグナル＝1行（signal_id で一意）。
+--   outcome: NO_ENTRY(指値に届かず) / TARGET(利確到達) / STOP(損切到達)
+--            / TIMEOUT(期間内に未決着) / PENDING(評価期間が未経過)
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+    signal_id        INTEGER PRIMARY KEY,          -- signals.id（1:1）
+    horizon_days     INTEGER NOT NULL,             -- 評価した営業日数（保有上限）
+    entry_filled     INTEGER,                      -- 1=計画 entry に価格が到達した
+    entry_fill_date  TEXT,                         -- 約定（到達）日 YYYY-MM-DD
+    outcome          TEXT,                          -- NO_ENTRY/TARGET/STOP/TIMEOUT/PENDING
+    hit_target       INTEGER,                      -- 1=target 到達
+    hit_stop         INTEGER,                      -- 1=stop 到達
+    days_to_resolve  INTEGER,                      -- 約定から決着までの営業日数
+    mfe_r            REAL,                          -- 最大含み益（R単位）
+    mae_r            REAL,                          -- 最大含み損（R単位）
+    close_at_horizon REAL,                          -- 期間末の終値
+    realized_r       REAL,                          -- 予測どおりに執行した場合の実現R
+    eval_through     TEXT,                          -- 評価に使った最終価格日 YYYY-MM-DD
+    evaluated_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (signal_id) REFERENCES signals(id) ON DELETE CASCADE
+);
+
+-- 調整可能パラメータの永続上書き（Web編集 → 次回スキャン/バックテストに実行時マージ）。
+-- key='param_overrides' の1行に {param: value} のフラットJSONを保存する。
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT    PRIMARY KEY,
+    value      TEXT    NOT NULL,            -- JSON
+    updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
 
 CREATE TABLE IF NOT EXISTS watchlist (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,7 +148,9 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     params          TEXT,                       -- JSON: 使用した主要パラメータ
     sharpe          REAL,                       -- Phase 7: シャープレシオ（年率換算）
     annual_return_pct REAL,                     -- Phase 7: 年率リターン%（複利）
-    equity_curve    TEXT                        -- Phase 7: 資産曲線 JSON
+    equity_curve    TEXT,                       -- Phase 7: 資産曲線 JSON
+    status          TEXT NOT NULL DEFAULT 'done', -- Web実行ジョブの状態 running/done/error
+    error           TEXT                        -- status='error' のときの失敗内容
 );
 """
 
@@ -126,12 +160,23 @@ _MIGRATIONS = [
     "ALTER TABLE backtest_runs ADD COLUMN annual_return_pct REAL",
     "ALTER TABLE backtest_runs ADD COLUMN equity_curve TEXT",
     "ALTER TABLE trades ADD COLUMN signal_id INTEGER",
+    "ALTER TABLE backtest_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'done'",
+    "ALTER TABLE backtest_runs ADD COLUMN error TEXT",
+    "ALTER TABLE signals ADD COLUMN discord_message_id TEXT",
 ]
 
 
 def get_connection(path: str | None = None) -> sqlite3.Connection:
-    """DB接続を返す。row_factory で dict 風アクセスを可能にし、スキーマを保証する。"""
-    conn = sqlite3.connect(path or db_path())
+    """DB接続を返す。row_factory で dict 風アクセスを可能にし、スキーマを保証する。
+
+    check_same_thread=False:
+        FastAPI は同期依存（api.deps.get_db）をスレッドプールで実行し、接続の
+        生成（yield 前）と close（finally）が別スレッドになることがある。
+        SQLite は既定で「生成スレッド以外からの使用」を禁止するため、そのままだと
+        間欠的に ProgrammingError になる。接続はリクエストごとに専用で、複数スレッド
+        から同時利用はされない（順次アクセスのみ）ため無効化して問題ない。
+    """
+    conn = sqlite3.connect(path or db_path(), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     init_schema(conn)

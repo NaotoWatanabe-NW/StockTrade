@@ -96,15 +96,21 @@ def get_trade(conn: sqlite3.Connection, trade_id: int) -> Optional[dict]:
     return _trade_row_to_dict(row) if row else None
 
 
-def list_trades(conn: sqlite3.Connection, code: Optional[str] = None) -> list[dict]:
+def list_trades(
+    conn: sqlite3.Connection,
+    code: Optional[str] = None,
+    signal_id: Optional[int] = None,
+) -> list[dict]:
+    """約定履歴を新しい順で返す。code / signal_id でフィルタ可能。"""
+    clauses, params = [], []
     if code:
-        rows = conn.execute(
-            "SELECT * FROM trades WHERE code = ? ORDER BY traded_at DESC, id DESC", (code,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM trades ORDER BY traded_at DESC, id DESC"
-        ).fetchall()
+        clauses.append("code = ?"); params.append(code)
+    if signal_id is not None:
+        clauses.append("signal_id = ?"); params.append(signal_id)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT * FROM trades{where} ORDER BY traded_at DESC, id DESC", params
+    ).fetchall()
     return [_trade_row_to_dict(r) for r in rows]
 
 
@@ -376,7 +382,7 @@ def list_backtest_runs(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
     rows = conn.execute(
         """SELECT id, run_at, universe, n_signals, n_filled, fill_rate, n_closed,
                   win_rate, avg_r, profit_factor, max_drawdown_r, time_stop_rate, params,
-                  sharpe, annual_return_pct
+                  sharpe, annual_return_pct, status, error
            FROM backtest_runs ORDER BY run_at DESC LIMIT ?""",
         (limit,),
     ).fetchall()
@@ -390,6 +396,60 @@ def get_backtest_run(conn: sqlite3.Connection, run_id: int) -> Optional[dict]:
         (run_id,),
     ).fetchone()
     return dict(row) if row else None
+
+
+def create_backtest_job(conn: sqlite3.Connection, universe: str, params: dict) -> int:
+    """Web実行用に status='running' のジョブ行を先に作り、採番した id を返す。
+
+    バックグラウンド実行が完了したら finish_backtest_run でメトリクスを書き込む。
+    params には実行リクエスト内容を入れておき、画面に「実行中」を即表示できるようにする。
+    """
+    import json
+    cur = conn.execute(
+        "INSERT INTO backtest_runs (universe, params, status) VALUES (?, ?, 'running')",
+        (universe, json.dumps(params, ensure_ascii=False)),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def finish_backtest_run(
+    conn: sqlite3.Connection, run_id: int, metrics: dict, params: dict
+) -> None:
+    """running ジョブ行にメトリクスを書き込み status='done' にする。"""
+    import json
+    pf = metrics.get("profit_factor", 0)
+    if pf == float("inf"):
+        pf = None  # SQLite は inf を扱えないため NULL
+    curve = metrics.get("equity_curve")
+    curve_json = json.dumps(curve, ensure_ascii=False) if curve else None
+    conn.execute(
+        """
+        UPDATE backtest_runs SET
+            n_signals = ?, n_filled = ?, fill_rate = ?, n_closed = ?,
+            win_rate = ?, avg_r = ?, profit_factor = ?, max_drawdown_r = ?,
+            time_stop_rate = ?, params = ?, sharpe = ?, annual_return_pct = ?,
+            equity_curve = ?, status = 'done', error = NULL
+        WHERE id = ?
+        """,
+        (
+            metrics.get("total_signals"), metrics.get("filled"), metrics.get("fill_rate"),
+            metrics.get("closed"), metrics.get("win_rate"), metrics.get("avg_r"), pf,
+            metrics.get("max_drawdown_r"), metrics.get("time_stop_rate"),
+            json.dumps(params, ensure_ascii=False), metrics.get("sharpe_ratio"),
+            metrics.get("annual_return_pct"), curve_json, run_id,
+        ),
+    )
+    conn.commit()
+
+
+def fail_backtest_run(conn: sqlite3.Connection, run_id: int, error: str) -> None:
+    """ジョブ行を status='error' にして失敗内容を記録する。"""
+    conn.execute(
+        "UPDATE backtest_runs SET status = 'error', error = ? WHERE id = ?",
+        (str(error)[:1000], run_id),
+    )
+    conn.commit()
 
 
 # ── signals（シグナル追跡：実取引のフィードバックループ） ──────────────
@@ -436,9 +496,44 @@ def save_signal(
     return get_signal(conn, cur.lastrowid)
 
 
+# 紐付く trades を集計してシグナルの建玉状況（株数・平均約定単価）を付与する。
+# CLOSED/realized_r は _on_signal_trade_change が signals 行に保存済みなので、
+# ここでは「何株・いくらで約定しているか」の表示用集計のみを行う。
+_SIGNAL_SELECT = """
+    SELECT s.*,
+        COALESCE(SUM(CASE WHEN t.side = 'BUY'  THEN t.shares END), 0) AS filled_shares,
+        COALESCE(SUM(CASE WHEN t.side = 'SELL' THEN t.shares END), 0) AS sold_shares,
+        SUM(CASE WHEN t.side = 'BUY'  THEN t.shares * t.price END) AS _buy_amount,
+        SUM(CASE WHEN t.side = 'SELL' THEN t.shares * t.price END) AS _sell_amount
+    FROM signals s
+    LEFT JOIN trades t ON t.signal_id = s.id
+"""
+
+
+def _signal_row_to_dict(row: sqlite3.Row) -> dict:
+    """集計列付きの signals 行を dict 化し、平均単価・残株・投資額を計算する。"""
+    d = dict(row)
+    filled = d.pop("filled_shares", 0) or 0
+    sold = d.pop("sold_shares", 0) or 0
+    buy_amount = d.pop("_buy_amount", None)
+    sell_amount = d.pop("_sell_amount", None)
+    avg_fill = (buy_amount / filled) if (buy_amount and filled) else None
+    avg_sell = (sell_amount / sold) if (sell_amount and sold) else None
+    remaining = filled - sold
+    d["filled_shares"] = filled
+    d["sold_shares"] = sold
+    d["avg_fill_price"] = avg_fill
+    d["avg_sell_price"] = avg_sell
+    d["remaining_shares"] = remaining
+    d["position_value"] = (remaining * avg_fill) if (avg_fill is not None and remaining > 0) else None
+    return d
+
+
 def get_signal(conn: sqlite3.Connection, signal_id: int) -> Optional[dict]:
-    row = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
-    return dict(row) if row else None
+    row = conn.execute(
+        _SIGNAL_SELECT + " WHERE s.id = ? GROUP BY s.id", (signal_id,)
+    ).fetchone()
+    return _signal_row_to_dict(row) if row else None
 
 
 def list_signals(
@@ -447,19 +542,22 @@ def list_signals(
     code: Optional[str] = None,
     limit: int = 100,
 ) -> list[dict]:
-    """シグナルを新しい順で返す。status / code でフィルタ可能。"""
+    """シグナルを新しい順で返す。status / code でフィルタ可能。
+
+    各行に紐付く約定(trades)の集計（建玉株数・平均約定単価・残株・投資額）を付与する。
+    """
     clauses, params = [], []
     if status:
-        clauses.append("status = ?"); params.append(status)
+        clauses.append("s.status = ?"); params.append(status)
     if code:
-        clauses.append("code = ?"); params.append(code)
+        clauses.append("s.code = ?"); params.append(code)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(limit)
     rows = conn.execute(
-        f"SELECT * FROM signals{where} ORDER BY generated_at DESC, id DESC LIMIT ?",
+        _SIGNAL_SELECT + where + " GROUP BY s.id ORDER BY s.generated_at DESC, s.id DESC LIMIT ?",
         params,
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [_signal_row_to_dict(r) for r in rows]
 
 
 def update_signal_status(conn: sqlite3.Connection, signal_id: int, status: str) -> Optional[dict]:
@@ -471,6 +569,39 @@ def update_signal_status(conn: sqlite3.Connection, signal_id: int, status: str) 
     conn.execute("UPDATE signals SET status = ? WHERE id = ?", (status, signal_id))
     conn.commit()
     return get_signal(conn, signal_id)
+
+
+def set_signal_message_id(conn: sqlite3.Connection, signal_id: int, message_id) -> None:
+    """シグナルに個別通知の Discord メッセージID を紐付ける（リアクション双方向用）。"""
+    conn.execute(
+        "UPDATE signals SET discord_message_id = ? WHERE id = ?",
+        (str(message_id), signal_id),
+    )
+    conn.commit()
+
+
+def get_signal_by_message_id(conn: sqlite3.Connection, message_id) -> Optional[dict]:
+    """Discord メッセージID からシグナルを逆引きする（集計列付き）。無ければ None。"""
+    row = conn.execute(
+        _SIGNAL_SELECT + " WHERE s.discord_message_id = ? GROUP BY s.id",
+        (str(message_id),),
+    ).fetchone()
+    return _signal_row_to_dict(row) if row else None
+
+
+def signals_pending_notification(conn: sqlite3.Connection) -> list[dict]:
+    """本日生成され個別通知がまだ送られていない（message_id 未設定の）OPEN シグナル。
+
+    Discord 双方向の追跡通知（per_signal_tracking）が新規シグナルだけを1件ずつ
+    通知するために使う。過去分の通知バックログを避けるため当日分に限定する。
+    """
+    rows = conn.execute(
+        _SIGNAL_SELECT
+        + " WHERE s.status = 'OPEN' AND s.discord_message_id IS NULL"
+        + " AND date(s.generated_at) = date('now')"
+        + " GROUP BY s.id ORDER BY s.generated_at",
+    ).fetchall()
+    return [_signal_row_to_dict(r) for r in rows]
 
 
 def exists_open_signal_today(conn: sqlite3.Connection, code: str, side: str) -> bool:
@@ -603,3 +734,142 @@ def signal_attribution(conn: sqlite3.Connection) -> dict:
         "bt_avg_r":       bt["avg_r"] if bt else None,
         "bt_fill_rate":   bt["fill_rate"] if bt else None,
     }
+
+
+# ── signal_outcomes（予測 vs 実勢価格：シグナル的中度の計測） ────────────
+
+# 評価が確定した（再評価不要な）outcome。PENDING はまだ確定していない。
+_RESOLVED_OUTCOMES = ("NO_ENTRY", "TARGET", "STOP", "TIMEOUT")
+
+_OUTCOME_FIELDS = (
+    "horizon_days", "entry_filled", "entry_fill_date", "outcome",
+    "hit_target", "hit_stop", "days_to_resolve", "mfe_r", "mae_r",
+    "close_at_horizon", "realized_r", "eval_through",
+)
+
+
+def save_signal_outcome(conn: sqlite3.Connection, signal_id: int, outcome: dict) -> None:
+    """シグナルの予測結果を signal_outcomes に upsert する（signal_id で一意）。
+
+    evaluated_at は列の DEFAULT (datetime('now')) に任せる。INSERT OR REPLACE で
+    再評価のたびに現在時刻へ更新される。
+    """
+    cols = ["signal_id", *_OUTCOME_FIELDS]
+    placeholders = ", ".join("?" for _ in cols)
+    values = [signal_id]
+    for f in _OUTCOME_FIELDS:
+        v = outcome.get(f)
+        values.append(int(v) if isinstance(v, bool) else v)
+    conn.execute(
+        f"INSERT OR REPLACE INTO signal_outcomes ({', '.join(cols)}) VALUES ({placeholders})",
+        values,
+    )
+    conn.commit()
+
+
+def get_signal_outcome(conn: sqlite3.Connection, signal_id: int) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM signal_outcomes WHERE signal_id = ?", (signal_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def signals_needing_outcome_eval(conn: sqlite3.Connection) -> list[dict]:
+    """予測結果の（再）評価が必要な BUY シグナルを返す。
+
+    対象: 結果行が無い、または outcome が PENDING（未確定）のもの。
+    確定済み（NO_ENTRY/TARGET/STOP/TIMEOUT）は再評価しない。
+    """
+    placeholders = ", ".join("?" for _ in _RESOLVED_OUTCOMES)
+    rows = conn.execute(
+        f"""
+        SELECT s.* FROM signals s
+        LEFT JOIN signal_outcomes o ON o.signal_id = s.id
+        WHERE s.side = 'BUY'
+          AND (o.signal_id IS NULL OR o.outcome NOT IN ({placeholders}))
+        ORDER BY s.generated_at
+        """,
+        _RESOLVED_OUTCOMES,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def score_calibration(conn: sqlite3.Connection, bucket_edges: Optional[list[float]] = None) -> list[dict]:
+    """確定済みの予測結果を score バケット別に集計し、的中度を返す。
+
+    score が高いシグナルほど本当に勝ちやすい／期待Rが高いか（キャリブレーション）
+    を確認するための集計。NO_ENTRY（未約定）は分母から除外し、約定に至った
+    予測のみで勝率・期待Rを出す。
+
+    bucket_edges : スコア境界（既定 [0,20,40,60,80,100]）。各区間 [lo, hi) で集計。
+    戻り値        : バケットごとの dict のリスト（昇順）。
+    """
+    edges = bucket_edges or [0, 20, 40, 60, 80, 100]
+    rows = conn.execute(
+        f"""
+        SELECT s.score AS score, o.outcome AS outcome, o.realized_r AS realized_r,
+               o.mfe_r AS mfe_r, o.mae_r AS mae_r
+        FROM signal_outcomes o
+        JOIN signals s ON s.id = o.signal_id
+        WHERE o.outcome IN ({", ".join("?" for _ in _RESOLVED_OUTCOMES)})
+          AND s.score IS NOT NULL
+        """,
+        _RESOLVED_OUTCOMES,
+    ).fetchall()
+
+    buckets = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        members = [r for r in rows if lo <= abs(r["score"]) < hi]
+        entered = [r for r in members if r["outcome"] != "NO_ENTRY"]
+        resolved_r = [r["realized_r"] for r in entered if r["realized_r"] is not None]
+        wins = sum(1 for x in resolved_r if x > 0)
+        mfes = [r["mfe_r"] for r in entered if r["mfe_r"] is not None]
+        buckets.append({
+            "score_lo":    lo,
+            "score_hi":    hi,
+            "n_signals":   len(members),
+            "n_entered":   len(entered),
+            "entry_rate":  (len(entered) / len(members)) if members else None,
+            "n_target":    sum(1 for r in entered if r["outcome"] == "TARGET"),
+            "n_stop":      sum(1 for r in entered if r["outcome"] == "STOP"),
+            "n_timeout":   sum(1 for r in entered if r["outcome"] == "TIMEOUT"),
+            "win_rate":    (wins / len(resolved_r)) if resolved_r else None,
+            "avg_r":       (sum(resolved_r) / len(resolved_r)) if resolved_r else None,
+            "avg_mfe_r":   (sum(mfes) / len(mfes)) if mfes else None,
+        })
+    return buckets
+
+
+# ── settings（調整可能パラメータの永続上書き） ────────────────────────
+
+_PARAM_OVERRIDES_KEY = "param_overrides"
+
+
+def get_param_overrides(conn: sqlite3.Connection) -> dict:
+    """保存済みのパラメータ上書き（フラット {param: value}）を返す。無ければ空 dict。"""
+    import json
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (_PARAM_OVERRIDES_KEY,)
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row["value"])
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def save_param_overrides(conn: sqlite3.Connection, overrides: dict) -> dict:
+    """パラメータ上書きを丸ごと保存（置換）する。保存後の dict を返す。"""
+    import json
+    conn.execute(
+        """
+        INSERT INTO settings (key, value, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+        """,
+        (_PARAM_OVERRIDES_KEY, json.dumps(overrides, ensure_ascii=False)),
+    )
+    conn.commit()
+    return get_param_overrides(conn)

@@ -13,9 +13,21 @@ from __future__ import annotations
 
 import logging
 
-from data.repository import save_signal, exists_open_signal_today
+from data.repository import save_signal, exists_open_signal_today, set_signal_message_id
 
 log = logging.getLogger(__name__)
+
+
+def notify_and_link_signal(conn, notifier, signal: dict) -> str | None:
+    """シグナルを個別通知し、返ってきた Discord メッセージID を signals に紐付ける。
+
+    notifier は send_signal_card(signal)->message_id を持つもの（DiscordNotifier）。
+    リアクション双方向（✅約定/❌見送り）のための紐付け。送信不可なら None。
+    """
+    msg_id = notifier.send_signal_card(signal)
+    if msg_id:
+        set_signal_message_id(conn, signal["id"], msg_id)
+    return msg_id
 
 
 def record_scan_signals(conn, results: list[dict]) -> int:

@@ -145,8 +145,16 @@ class StockScreener:
             })
 
             score_txt = f"{d.consensus.score:+.0f}" if d.consensus else "-"
+            plan = d.trade_plan
+            price_txt = ""
+            if plan:
+                price_txt = (
+                    f" | {plan['entry_kind']} {market.fmt(plan['entry'])}"
+                    f" 損切 {market.fmt(plan['stop'])}"
+                    f" 利確 {market.fmt(plan['target'])}"
+                )
             log.info(f"  ✓ [{market.code}] {name}（{code}）: "
-                     f"score {score_txt} / {[s['type'] for s in d.signals]}")
+                     f"score {score_txt} / {[s['type'] for s in d.signals]}{price_txt}")
 
         # 確度の高い順（スコア降順）に並べる
         results.sort(key=lambda r: r["score"].score if r["score"] else 0, reverse=True)

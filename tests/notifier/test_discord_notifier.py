@@ -20,6 +20,28 @@ US_ENTRY_PLAN = {
     "risk_pct": 5.0, "reward_pct": 10.0,
 }
 
+_SIGNAL_ROW = {
+    "id": 1, "code": "7011", "name": "三菱重工", "market": "JP", "side": "BUY",
+    "entry_price": 1000.0, "stop_price": 950.0, "target_price": 1150.0, "score": 42.0,
+}
+
+
+class TestSendSignalCard:
+    def test_returns_message_id_on_success(self):
+        n = DiscordNotifier("https://discord.test/webhook")
+        fake = MagicMock()
+        fake.json.return_value = {"id": "999"}
+        fake.raise_for_status.return_value = None
+        with patch("notifier.discord_notifier.requests.post", return_value=fake) as p:
+            mid = n.send_signal_card(_SIGNAL_ROW)
+        assert mid == "999"
+        # wait=true で叩いてメッセージIDを取得している
+        assert p.call_args.kwargs.get("params") == {"wait": "true"}
+
+    def test_returns_none_when_webhook_disabled(self):
+        n = DiscordNotifier("")
+        assert n.send_signal_card(_SIGNAL_ROW) is None
+
 
 # ──────────────────────────────────────────────────────────
 # _shares_summary

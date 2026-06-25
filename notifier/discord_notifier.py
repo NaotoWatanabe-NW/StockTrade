@@ -219,6 +219,47 @@ class DiscordNotifier:
             "timestamp": _now_iso(),
         })
 
+    def send_signal_card(self, signal: dict) -> Optional[str]:
+        """シグナル1件を個別通知し、Discordメッセージ ID を返す（双方向リアクション用）。
+
+        webhook を wait=true で叩くと作成されたメッセージの JSON が返り、id を取得できる。
+        Bot 側はこの id でリアクション→シグナルを逆引きする。
+        未送信（URL未設定）・失敗時は None。signal は signals 行の dict。
+        """
+        cur = "¥" if (signal.get("market") == "JP") else "$"
+
+        def _p(v):
+            return f"{cur}{v:,.0f}" if v is not None else "—"
+
+        fields = [
+            {"name": "指値", "value": _p(signal.get("entry_price")), "inline": True},
+            {"name": "損切り", "value": _p(signal.get("stop_price")), "inline": True},
+            {"name": "利確", "value": _p(signal.get("target_price")), "inline": True},
+        ]
+        score = signal.get("score")
+        title = f"⚡ シグナル：{signal.get('name') or signal.get('code')}（{signal.get('code')}）"
+        embed = {
+            "title": title,
+            "description": f"{signal.get('side')} / スコア {score:+.0f}" if score is not None else signal.get("side"),
+            "color": 0x2ECC71 if signal.get("side") == "BUY" else 0xE74C3C,
+            "fields": fields,
+            "footer": {"text": "✅=約定を記録 / ❌=見送り（リアクションで反映）"},
+            "timestamp": _now_iso(),
+        }
+
+        if not self.enabled:
+            print(f"[Discord個別通知（未送信・URL未設定）] {signal.get('code')} {signal.get('side')}")
+            return None
+        try:
+            res = requests.post(self.webhook_url, params={"wait": "true"},
+                                json={"embeds": [embed]}, timeout=10)
+            res.raise_for_status()
+            msg_id = res.json().get("id")
+            return str(msg_id) if msg_id else None
+        except Exception as e:
+            log.error(f"Discord個別通知エラー: {e}")
+            return None
+
     def notify_error(self, message: str):
         self._send({
             "title": "⚠️ エラー発生",

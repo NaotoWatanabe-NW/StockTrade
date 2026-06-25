@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from typing import Optional
 
 import config
 from backtest.metrics import compute_metrics, format_report
@@ -113,131 +114,267 @@ def _build_backtest_cfg(args, base: dict) -> dict:
     return cfg
 
 
+# Web/CLI から調整可能なパラメータ（フラット名）→ 反映先 cfg の対応。
+# ここに無いキーは無視せず ValueError にしてタイポ・誤設定を早期に検出する。
+#   min_abs_score は simulator が backtest_cfg から読むため "backtest" に置く。
+_PARAM_TARGETS: dict[str, str] = {
+    "atr_entry_pullback":  "trade_plan",
+    "atr_stop_mult":       "trade_plan",
+    "reward_risk_ratio":   "trade_plan",
+    "trail_atr_mult":      "exit",
+    "partial_tp_r":        "exit",
+    "partial_tp_pct":      "exit",
+    "move_to_breakeven":   "exit",
+    "min_abs_score":       "backtest",
+    "breakout_lookback":   "screening",
+    "ma_short":            "screening",
+    "ma_long":             "screening",
+    "rsi_period":          "screening",
+    "rsi_oversold":        "screening",
+    "rsi_overbought":      "screening",
+    "volume_spike_ratio":  "screening",
+    "weekly_trend_filter": "regime",
+    "adx_min":             "regime",
+    "index_ma":            "regime",
+}
+
+
+def current_param_defaults() -> dict:
+    """調整可能パラメータの現在の有効値（デフォルト⊕DB上書き）を {param: value} で返す。
+
+    config の getter を経由するため、Webで保存した永続上書きが反映される。
+    Web のバックテストフォームの初期値、およびパラメータ編集画面の土台。
+    """
+    src = {
+        "TRADE_PLAN_CONFIG": config.get_trade_plan_config(),
+        "EXIT_CONFIG":       config.get_exit_config(),
+        "SCORING_CONFIG":    config.get_scoring_config(),
+        "SCREENING_CONFIG":  config.get_screening_config(),
+        "REGIME_CONFIG":     config.get_regime_config(),
+        "RISK_CONFIG":       config.get_risk_config(),
+    }
+    out: dict = {}
+    for key, section in config.PARAM_SECTIONS.items():
+        cfg = src.get(section)
+        if cfg is not None and key in cfg:
+            out[key] = cfg[key]
+    return out
+
+
+def _apply_param_overrides(overrides: Optional[dict], cfgs: dict[str, Optional[dict]]) -> None:
+    """フラットなパラメータ上書きを対応する cfg dict（コピー）に適用する。
+
+    cfgs: {"trade_plan": ..., "exit": ..., "backtest": ..., "screening": ...,
+           "scoring": ..., "regime": ...}（regime は無効時 None）
+    未知のキーは ValueError。regime が無効（None）なのに regime 系キーが来た場合は無視する。
+    """
+    for key, value in (overrides or {}).items():
+        target_name = _PARAM_TARGETS.get(key)
+        if target_name is None:
+            raise ValueError(f"未知のバックテストパラメータ: {key}")
+        target = cfgs.get(target_name)
+        if target is None:
+            continue  # 例: regime 無効時に regime パラメータが渡された
+        target[key] = value
+
+
+def run_backtest(
+    universe: str = "ALL",
+    *,
+    regime: bool = True,
+    no_partial_tp: bool = False,
+    min_score: Optional[float] = None,
+    param_overrides: Optional[dict] = None,
+    no_cache: bool = False,
+    save: bool = True,
+    conn=None,
+) -> dict:
+    """1回分のバックテストを実行して結果を返す（CLIとWeb APIで共有する純粋実行関数）。
+
+    config の各 cfg はコピーして使う（グローバル設定を破壊しない）。param_overrides で
+    個別パラメータを上書きできる。戻り値:
+        {"run_id", "metrics", "trades", "no_fills", "params"}
+    run_id は save=True で保存できた場合のみ非 None。
+    """
+    codes = config.SCREENING_UNIVERSE
+    if universe == "JP":
+        codes = config.SCREENING_UNIVERSE_JP
+    elif universe == "US":
+        codes = config.SCREENING_UNIVERSE_US
+
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
+
+    all_trades: list[Trade] = []
+    all_no_fills: list[NoFill] = []
+    index_by_market: dict[str, object] = {}
+    try:
+        # 永続上書き（settings）を反映した有効 config を組み立てる。
+        # 上書きは「渡された conn」から読む（バックテスト DB と同一スコープで一貫させる）。
+        from data.repository import get_param_overrides
+        overrides = get_param_overrides(conn)
+        screening_cfg  = config._effective_section("SCREENING_CONFIG", overrides)
+        scoring_cfg    = config._effective_section("SCORING_CONFIG", overrides)
+        trade_plan_cfg = config._effective_section("TRADE_PLAN_CONFIG", overrides)
+        backtest_cfg   = dict(config.BACKTEST_CONFIG)
+        # simulator は min_abs_score を backtest_cfg から読むため、永続設定値を写す。
+        if "min_abs_score" in scoring_cfg:
+            backtest_cfg["min_abs_score"] = scoring_cfg["min_abs_score"]
+        if min_score is not None:
+            backtest_cfg["min_abs_score"] = min_score
+        exit_cfg = config._effective_section("EXIT_CONFIG", overrides)
+        if no_partial_tp:
+            exit_cfg["partial_tp_pct"] = 0.0
+            exit_cfg["move_to_breakeven"] = False
+        regime_cfg = config._effective_section("REGIME_CONFIG", overrides) if regime else None
+
+        _apply_param_overrides(param_overrides, {
+            "screening": screening_cfg, "scoring": scoring_cfg,
+            "trade_plan": trade_plan_cfg, "backtest": backtest_cfg,
+            "exit": exit_cfg, "regime": regime_cfg,
+        })
+
+        years = int(str(backtest_cfg.get("history", "5y")).rstrip("y"))
+        # レジームフィルタ有効時は指数データをスキャン開始前に1回取得
+        if regime_cfg:
+            _fetch_index_df(regime_cfg, codes, index_by_market)
+
+        for code in codes:
+            market = resolve_market(code)
+            log.info(f"処理中: {code} [{market.code}]")
+
+            if no_cache:
+                from core.data_client import StockDataClient
+                client = StockDataClient(rate_limit_sec=1.0)
+                df = client.get_history(code, market, period=f"{years}y", interval="1d")
+            else:
+                df = get_history_cached(conn, code, market, interval="1d", years=years)
+
+            if df is None or df.empty:
+                log.warning(f"  スキップ（データなし）: {code}")
+                continue
+
+            df_weekly = None
+            if regime_cfg and regime_cfg.get("weekly_trend_filter", True):
+                df_weekly = get_history_cached(conn, code, market, interval="1wk", years=years)
+
+            trades, no_fills = simulate_symbol(
+                code, df, screening_cfg, scoring_cfg, trade_plan_cfg, backtest_cfg, exit_cfg,
+                regime_cfg=regime_cfg,
+                df_weekly=df_weekly,
+                df_index=index_by_market.get(market.code),
+            )
+            all_trades.extend(trades)
+            all_no_fills.extend(no_fills)
+
+            sym = compute_metrics(trades, no_fills)
+            log.info(
+                f"  {code}: signal={sym['total_signals']} "
+                f"fill={sym['fill_rate']*100:.0f}% "
+                f"win={sym['win_rate']*100:.0f}% "
+                f"avgR={sym['avg_r']:+.2f}"
+            )
+
+        total_metrics = compute_metrics(
+            all_trades, all_no_fills,
+            risk_cfg=config._effective_section("RISK_CONFIG", overrides),
+        )
+
+        params_snapshot = {
+            "screening_cfg":  screening_cfg,
+            "scoring_cfg":    scoring_cfg,
+            "trade_plan_cfg": trade_plan_cfg,
+            "exit_cfg":       exit_cfg,
+            "backtest_cfg":   backtest_cfg,
+            "regime":         bool(regime_cfg),
+        }
+
+        run_id = None
+        if save:
+            from data.repository import save_backtest_run
+            run_id = save_backtest_run(conn, universe, total_metrics, params_snapshot)
+            log.info(f"バックテスト結果を保存しました（id={run_id}）")
+    finally:
+        if own_conn:
+            conn.close()
+
+    return {
+        "run_id": run_id,
+        "metrics": total_metrics,
+        "trades": all_trades,
+        "no_fills": all_no_fills,
+        "params": params_snapshot,
+    }
+
+
+def _print_by_code(all_trades: list, all_no_fills: list) -> None:
+    """銘柄別サマリーを標準出力に出す（CLI 表示専用）。"""
+    by_code: dict[str, tuple[list, list]] = {}
+    for t in all_trades:
+        by_code.setdefault(t.code, ([], []))[0].append(t)
+    for nf in all_no_fills:
+        by_code.setdefault(nf.code, ([], []))[1].append(nf)
+    if not by_code:
+        return
+
+    print("\n── 銘柄別サマリー ──────────────────────────")
+    header = f"{'コード':<8} {'シグナル':>8} {'約定率':>7} {'勝率':>7} {'avgR':>7} {'PF':>6}"
+    print(header)
+    print("-" * len(header))
+    rows = []
+    for code, (trs, nfs) in by_code.items():
+        m = compute_metrics(trs, nfs)
+        pf = m["profit_factor"]
+        pf_str = f"{pf:.2f}" if pf != float("inf") else "∞"
+        rows.append((
+            m["avg_r"],
+            f"{code:<8} {m['total_signals']:>8} "
+            f"{m['fill_rate']*100:>6.0f}% "
+            f"{m['win_rate']*100:>6.0f}% "
+            f"{m['avg_r']:>+7.3f} "
+            f"{pf_str:>6}",
+        ))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    for _, line in rows:
+        print(line)
+
+
 def run(args) -> int:
+    """CLI エントリ。--optimize は専用パス、通常は run_backtest() を呼んで整形出力する。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.StreamHandler()],
     )
 
-    universe = config.SCREENING_UNIVERSE
-    if args.universe == "JP":
-        universe = config.SCREENING_UNIVERSE_JP
-    elif args.universe == "US":
-        universe = config.SCREENING_UNIVERSE_US
-
-    screening_cfg   = config.SCREENING_CONFIG
-    scoring_cfg     = config.SCORING_CONFIG
-    trade_plan_cfg  = config.TRADE_PLAN_CONFIG
-    backtest_cfg    = _build_backtest_cfg(args, config.BACKTEST_CONFIG)
-    exit_cfg        = dict(config.EXIT_CONFIG)
-    if args.no_partial_tp:
-        exit_cfg["partial_tp_pct"] = 0.0
-        exit_cfg["move_to_breakeven"] = False
-
-    regime_cfg = None if args.no_regime else config.REGIME_CONFIG
-
-    years = int(backtest_cfg.get("history", "5y").rstrip("y"))
-
-    # ──────────────────────────────────────────
-    # ウォークフォワード最適化モード
-    # ──────────────────────────────────────────
+    # ウォークフォワード最適化モード（cfg を構築して専用パスへ）
     if args.optimize:
-        return _run_optimize(args, universe, screening_cfg, scoring_cfg, trade_plan_cfg,
-                             backtest_cfg, exit_cfg, regime_cfg, years)
+        universe = config.SCREENING_UNIVERSE
+        if args.universe == "JP":
+            universe = config.SCREENING_UNIVERSE_JP
+        elif args.universe == "US":
+            universe = config.SCREENING_UNIVERSE_US
+        backtest_cfg = _build_backtest_cfg(args, config.BACKTEST_CONFIG)
+        exit_cfg = dict(config.EXIT_CONFIG)
+        if args.no_partial_tp:
+            exit_cfg["partial_tp_pct"] = 0.0
+            exit_cfg["move_to_breakeven"] = False
+        regime_cfg = None if args.no_regime else config.REGIME_CONFIG
+        years = int(backtest_cfg.get("history", "5y").rstrip("y"))
+        return _run_optimize(args, universe, config.SCREENING_CONFIG, config.SCORING_CONFIG,
+                             config.TRADE_PLAN_CONFIG, backtest_cfg, exit_cfg, regime_cfg, years)
 
-    all_trades: list[Trade] = []
-    all_no_fills: list[NoFill] = []
-
-    # レジームフィルタ有効時は指数データをスキャン開始前に1回取得
-    index_by_market: dict[str, object] = {}
-    if regime_cfg:
-        _fetch_index_df(regime_cfg, universe, index_by_market)
-
-    conn = get_connection()
-    for code in universe:
-        market = resolve_market(code)
-        log.info(f"処理中: {code} [{market.code}]")
-
-        if args.no_cache:
-            from core.data_client import StockDataClient
-            client = StockDataClient(rate_limit_sec=1.0)
-            df = client.get_history(code, market, period=f"{years}y", interval="1d")
-        else:
-            df = get_history_cached(conn, code, market, interval="1d", years=years)
-
-        if df is None or df.empty:
-            log.warning(f"  スキップ（データなし）: {code}")
-            continue
-
-        # 週足データ（レジームフィルタ有効時のみ）
-        df_weekly = None
-        if regime_cfg and regime_cfg.get("weekly_trend_filter", True):
-            df_weekly = get_history_cached(conn, code, market, interval="1wk", years=years)
-
-        trades, no_fills = simulate_symbol(
-            code, df, screening_cfg, scoring_cfg, trade_plan_cfg, backtest_cfg, exit_cfg,
-            regime_cfg=regime_cfg,
-            df_weekly=df_weekly,
-            df_index=index_by_market.get(market.code),
-        )
-        all_trades.extend(trades)
-        all_no_fills.extend(no_fills)
-
-        sym_metrics = compute_metrics(trades, no_fills)
-        log.info(
-            f"  {code}: signal={sym_metrics['total_signals']} "
-            f"fill={sym_metrics['fill_rate']*100:.0f}% "
-            f"win={sym_metrics['win_rate']*100:.0f}% "
-            f"avgR={sym_metrics['avg_r']:+.2f}"
-        )
-
-    # ── 集計レポート ──────────────────────────────────────────────────
-    total_metrics = compute_metrics(all_trades, all_no_fills, risk_cfg=config.RISK_CONFIG)
-    print("\n" + format_report(total_metrics, title="全銘柄集計"))
-
-    # --save フラグで DB に保存
-    if args.save:
-        from data.repository import save_backtest_run
-        params_snapshot = {
-            "exit_cfg":     exit_cfg,
-            "backtest_cfg": backtest_cfg,
-            "regime":       bool(regime_cfg),
-        }
-        run_id = save_backtest_run(conn, args.universe, total_metrics, params_snapshot)
-        log.info(f"バックテスト結果を保存しました（id={run_id}）")
-
-    conn.close()
-
-    # 銘柄別集計（シグナルが存在したものだけ）
-    by_code: dict[str, tuple[list, list]] = {}
-    for t in all_trades:
-        by_code.setdefault(t.code, ([], []))[0].append(t)
-    for nf in all_no_fills:
-        by_code.setdefault(nf.code, ([], []))[1].append(nf)
-
-    if by_code:
-        print("\n── 銘柄別サマリー ──────────────────────────")
-        header = f"{'コード':<8} {'シグナル':>8} {'約定率':>7} {'勝率':>7} {'avgR':>7} {'PF':>6}"
-        print(header)
-        print("-" * len(header))
-        rows = []
-        for code, (trs, nfs) in by_code.items():
-            m = compute_metrics(trs, nfs)
-            pf = m["profit_factor"]
-            pf_str = f"{pf:.2f}" if pf != float("inf") else "∞"
-            rows.append((
-                m["avg_r"],
-                f"{code:<8} {m['total_signals']:>8} "
-                f"{m['fill_rate']*100:>6.0f}% "
-                f"{m['win_rate']*100:>6.0f}% "
-                f"{m['avg_r']:>+7.3f} "
-                f"{pf_str:>6}",
-            ))
-        rows.sort(key=lambda x: x[0], reverse=True)
-        for _, line in rows:
-            print(line)
-
+    result = run_backtest(
+        universe=args.universe,
+        regime=not args.no_regime,
+        no_partial_tp=args.no_partial_tp,
+        min_score=args.min_score,
+        no_cache=args.no_cache,
+        save=args.save,
+    )
+    print("\n" + format_report(result["metrics"], title="全銘柄集計"))
+    _print_by_code(result["trades"], result["no_fills"])
     return 0
 
 

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import {
   Trade,
@@ -186,6 +187,7 @@ export default function TradesPage() {
               <th className="num">株数</th>
               <th className="num">単価</th>
               <th className="num">手数料</th>
+              <th>区分</th>
               <th>メモ</th>
               <th></th>
             </tr>
@@ -202,6 +204,15 @@ export default function TradesPage() {
                 <td className="num">{t.shares}</td>
                 <td className="num">{fmtPrice(t.code, t.price)}</td>
                 <td className="num">{fmtPrice(t.code, t.fee)}</td>
+                <td>
+                  {t.signal_id != null ? (
+                    <Link href="/signals" title={`シグナル #${t.signal_id} に紐付く予測ベースの約定`}>
+                      🔗 シグナル#{t.signal_id}
+                    </Link>
+                  ) : (
+                    <span className="muted">単独注文</span>
+                  )}
+                </td>
                 <td className="muted">{t.note ?? ""}</td>
                 <td className="num">
                   <button className="danger" onClick={() => remove(t.id)}>
@@ -212,7 +223,7 @@ export default function TradesPage() {
             ))}
             {items.length === 0 && (
               <tr>
-                <td colSpan={9} className="muted">
+                <td colSpan={10} className="muted">
                   まだ約定記録がありません。
                 </td>
               </tr>

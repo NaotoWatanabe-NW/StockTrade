@@ -24,13 +24,13 @@ Discordに通知
 
 ```
 StockTrade/
-├── config.py                    # 保有取得・監視銘柄・閾値・注文プラン設定
+├── config.py                    # 監視銘柄・閾値・注文プラン・サイジング等の設定＋実行時マージ用getter
 ├── main.py                      # メイン実行スクリプト（監視＋スクリーニング）
 ├── requirements.txt             # 依存パッケージ
-├── stock.db                     # SQLite（保有・約定・シグナル履歴・価格キャッシュ）
+├── stock.db                     # SQLite（保有・約定・シグナル・成績・価格キャッシュ・設定）
 ├── run_monitor.sh               # 監視の定期実行ランナー（cron用）
 ├── run_idle_check.sh            # 寝ている資産チェックの定期実行ランナー（cron用）
-├── run_web.sh                   # Webアプリ（API＋フロント）起動ランナー
+├── run_web.sh                   # Webアプリ（API＋フロント）を空きポートで同時起動
 ├── core/
 │   ├── data_client.py           # yfinanceクライアント（日本/米国対応）
 │   ├── market.py                # 市場判定（東証/米国・通貨・取引時間）
@@ -40,34 +40,38 @@ StockTrade/
 │   ├── trade_plan.py            # 指値・損切り・利確の算出（ATR基準）
 │   ├── orders.py                # SBI注文タイプ（指値/逆指値/OCO/IFD/IFDOCO）組立
 │   ├── exit_rules.py            # 保有ロングの手仕舞いルール
-│   ├── risk.py                  # ポジションサイジング
+│   ├── risk.py                  # ポジションサイジング（固定リスク%→株数）
 │   ├── regime.py                # 相場レジーム判定（トレンド/チョップ）
 │   └── events.py                # 決算回避フィルタ
 ├── screener/
 │   ├── engine.py                # スクリーニング＋保有損益エンジン
-│   └── signal_log.py            # シグナル履歴の記録
+│   ├── signal_log.py            # シグナル履歴の記録＋個別通知の紐付け
+│   └── signal_outcome.py        # シグナルの予測 vs 実勢価格の決着評価
 ├── notifier/
-│   └── discord_notifier.py      # Discord通知
+│   ├── discord_notifier.py      # Discord通知（Webhook送信）
+│   └── discord_bot.py           # Discord双方向Bot（リアクションで約定/見送り・任意）
 ├── data/
-│   ├── db.py                    # SQLite接続・スキーマ
-│   ├── repository.py            # holdings/trades などCRUD
-│   └── price_cache.py           # 価格データのキャッシュ
+│   ├── db.py                    # SQLite接続・スキーマ・マイグレーション
+│   ├── repository.py            # holdings/trades/signals/backtest/settings のCRUD
+│   └── price_cache.py           # 価格データのDBキャッシュ
 ├── scripts/
 │   ├── migrate_holdings.py      # 旧 holdings_local.py → DB 移行（初回のみ）
 │   ├── migrate_watchlist.py     # 監視ユニバース → DB 移行（初回のみ）
-│   └── notify_idle_holdings.py  # 寝ている資産を検出してDiscord通知
+│   ├── notify_idle_holdings.py  # 寝ている資産を検出してDiscord通知
+│   └── evaluate_signal_outcomes.py # 過去シグナルの予測結果を評価して記録
 ├── backtest/
-│   ├── runner.py                # バックテスト実行
+│   ├── runner.py                # バックテスト実行（CLI／Web共有の run_backtest）
 │   ├── simulator.py             # 約定シミュレーション
 │   ├── metrics.py               # 成績指標の算出
-│   └── optimizer.py             # パラメータ最適化
-├── api/                         # FastAPIバックエンド（取引記録Webアプリ）
+│   └── optimizer.py             # ウォークフォワード最適化
+├── api/                         # FastAPIバックエンド（Webアプリ）
 │   ├── main.py / deps.py / schemas.py
-│   └── routers/                 # holdings/trades/pnl/portfolio/signals/watchlist/backtest
-└── web/                         # フロントエンド（Next.js + TypeScript）
-    ├── app/                     # 画面（ダッシュボード/保有/取引/損益）
-    ├── components/              # UIコンポーネント
-    └── lib/                     # APIクライアント
+│   └── routers/                 # holdings/trades/pnl/portfolio/signals/watchlist/backtest/settings
+├── web/                         # フロントエンド（Next.js + TypeScript）
+│   ├── app/                     # 画面（ダッシュボード/保有/ウォッチリスト/取引/損益/シグナル/バックテスト/設定）
+│   ├── components/              # UIコンポーネント
+│   └── lib/                     # APIクライアント
+└── docs/                        # 設計ドキュメント（戦略・Webアプリ・ロードマップ）
 ```
 
 ---
@@ -171,10 +175,32 @@ cron で回す場合は同梱の `run_idle_check.sh` を使う（引数はその
 
 ---
 
-## 取引記録 Web アプリ
+## Web アプリ
 
-保有銘柄の管理（長期保有フラグ含む）と約定履歴・実現損益を、ブラウザから操作できます。
-データは SQLite（`stock.db`）。保有はこのアプリで編集すると監視ツールに即反映されます。
+保有・ウォッチリストの管理、約定履歴・実現損益、シグナル追跡、バックテスト、
+パラメータ設定までをブラウザから操作できます。データは SQLite（`stock.db`）で
+監視ツールと共有し、保有・ウォッチリスト・パラメータの編集は**次回スキャンに即反映**されます。
+
+### 起動（推奨：API＋フロントを同時起動）
+
+```bash
+./run_web.sh          # 開発モード（uvicorn --reload ＋ npm run dev）
+./run_web.sh --prod   # 本番モード（next build → start）
+```
+
+`run_web.sh` は**空きポートを2つ自動取得**し、`web/.env.local` の
+`NEXT_PUBLIC_API_BASE` をAPIのポートに自動で書き換えて両者を起動します
+（Ctrl-C で両方停止）。起動ログに URL が出ます。
+
+> ⚠️ 個別に起動する場合は、フロントの `web/.env.local` の `NEXT_PUBLIC_API_BASE` を
+> バックエンドの URL に合わせること（ポート不一致だと接続エラーになります）。
+
+単体起動の例:
+
+```bash
+.venv/bin/uvicorn api.main:app --reload --port 8000   # /docs で Swagger UI
+cd web && cp .env.local.example .env.local && npm run dev
+```
 
 ### 初回のみ：既存の保有を DB へ移行
 
@@ -182,23 +208,18 @@ cron で回す場合は同梱の `run_idle_check.sh` を使う（引数はその
 .venv/bin/python -m scripts.migrate_holdings
 ```
 
-### バックエンド（FastAPI, ポート8000）
+### 画面一覧
 
-```bash
-.venv/bin/uvicorn api.main:app --reload --port 8000
-# http://localhost:8000/docs で Swagger UI も使えます
-```
-
-### フロントエンド（Next.js, ポート3000）
-
-```bash
-cd web
-npm install            # 初回のみ
-cp .env.local.example .env.local   # APIのURL（既定 http://localhost:8000）
-npm run dev            # http://localhost:3000
-```
-
-画面: ダッシュボード / 保有銘柄 / 取引記録 / 損益。
+| 画面 | 内容 |
+| --- | --- |
+| ダッシュボード | 保有評価・ポートフォリオ熱量などの概況 |
+| 保有銘柄 | 建値・株数・長期保有フラグの管理（監視ツールに即反映） |
+| ウォッチリスト | スクリーニング対象ユニバースの管理 |
+| 取引記録 | 約定の記録。シグナル紐付けの有無（予測ベース/単独注文）を表示 |
+| 損益 | 実現損益（譲渡益課税を反映した税引後も表示） |
+| シグナル | シグナル追跡（約定/決済の記録・ライブ成績 vs バックテスト・スコア較正・推奨サイジング） |
+| バックテスト | パラメータを指定してWeb実行・履歴・資産曲線 |
+| 設定 | 売買シグナル・資金管理のパラメータ編集（保存で即反映） |
 
 ---
 
@@ -211,10 +232,11 @@ npm run dev            # http://localhost:3000
 | 🟢 RSI売られすぎから回復 | RSIが30を下から上に通過 |
 | 🔴 RSI買われすぎから反落 | RSIが70を上から下に通過 |
 | 📊 出来高急増 | 出来高が20日平均の2倍以上 |
-| 🚀 高値ブレイクアウト | 過去20日高値を更新 |
-| 📉 安値ブレイクダウン | 過去20日安値を割り込み |
+| 🚀 高値ブレイクアウト | 過去30日高値を更新 |
+| 📉 安値ブレイクダウン | 過去30日安値を割り込み |
 
-`config.py` の `SCREENING_CONFIG` で閾値調整可能です。
+閾値は `config.py` の `SCREENING_CONFIG` または **Webの「設定」画面**から調整できます
+（設定画面の変更は次回スキャン／バックテストに即反映）。
 
 ---
 
@@ -229,12 +251,13 @@ npm run dev            # http://localhost:3000
 | --- | --- |
 | 押し目買いの指値 | 現値 − 0.5×ATR |
 | ブレイク買いの逆指値 | 現値 + 0.5×ATR（飛び乗り） |
-| 損切り | エントリー − 2×ATR |
-| 利確 | エントリー + リスク幅×2（RR 2:1） |
+| 損切り | エントリー − 2.5×ATR |
+| 利確 | エントリー + リスク幅×3（RR 3:1） |
 | 戻り売りの指値（手仕舞い） | 現値 + 0.5×ATR |
 | 撤退の逆指値（手仕舞い） | 現値 − 2×ATR |
 
-倍率は `config.py` の `TRADE_PLAN_CONFIG` で調整できます。
+倍率は `config.py` の `TRADE_PLAN_CONFIG`（または Webの「設定」画面）で調整できます。
+上表は既定値で、出口・サイジングは `EXIT_CONFIG` / `RISK_CONFIG` でさらに細かく調整します。
 
 ### 注文タイプの自動選択
 
@@ -286,6 +309,82 @@ ORDER_CONFIG = {
 
 ---
 
+## バックテストと戦略検証
+
+ライブ通知とまったく同じ意思決定ロジックを過去データに適用し、勝率・期待値R・
+プロフィットファクター・最大DD・約定率・Sharpe・年率リターンを算出します。
+履歴は `stock.db` の `price_history` にキャッシュ（~5年）し、レート制限を回避します。
+
+```bash
+# CLI（結果を DB に保存）
+.venv/bin/python -m backtest.runner --universe JP --save
+.venv/bin/python -m backtest.runner --no-regime --save     # レジームフィルタ無効で比較
+.venv/bin/python -m backtest.runner --optimize             # ウォークフォワード最適化
+```
+
+Webの「バックテスト」画面からは、**ユニバース・各パラメータを指定して実行**できます
+（バックグラウンド実行＋ポーリングで状態表示。結果と資産曲線・使用パラメータを履歴で確認）。
+
+---
+
+## シグナル追跡とライブ約定率
+
+スクリーナーが出したシグナルは `signals` テーブルに記録され、Webの「シグナル」画面で
+追跡できます。実際にエントリー／決済したら**約定を記録**すると（`signal_id` 付きの取引として
+取引記録・損益にも反映）、状態が `OPEN → 建玉中 → 決済済` と進み、**実現R**が自動計算されます。
+
+- **ライブ成績 vs バックテスト期待値**: 実取引の勝率・平均Rを最新バックテストの期待値と比較
+- **スコア較正**: スコア帯ごとの予測的中度（`python -m scripts.evaluate_signal_outcomes` で更新）
+- **ライブ約定率**: 有効期限（既定15営業日）を過ぎた OPEN は読み取り時に自動で `期限切れ` へ遷移し、
+  約定到達率が滞留せず正確に出ます
+
+---
+
+## パラメータ設定（Webで編集・即反映）
+
+売買シグナル検出・出口・資金管理のしきい値を、Webの「設定」画面で編集できます。
+保存値は `stock.db` の `settings` に永続化され、`config.py` の getter が**実行時にマージ**するため、
+**次回のスキャン／バックテストに再起動なしで反映**されます。編集対象はスクリーニング・スコア・
+注文プラン・出口・レジーム・資金管理（口座サイズ等）のパラメータです。
+
+---
+
+## 推奨サイジング（口座残高 → 何株買うか）
+
+固定リスク%方式（`許容リスク額 = 口座サイズ × リスク%`、損切り幅で割って株数を算出）で、
+OPEN な買いシグナルごとの**推奨株数・投資額・実リスク額**を提示します。口座サイズ・1トレード
+リスク%・同時保有上限は `RISK_CONFIG`（設定画面で編集可）に従います。Webの「シグナル」画面の
+「推奨サイジング」カードで確認できます。
+
+---
+
+## 実現損益と譲渡益課税
+
+「損益」画面は実現損益を表示し、上場株式等の**譲渡益課税（申告分離 20.315%）**を反映した
+税引後も表示します。利益（譲渡益）にのみ課税し、同一通貨グループ内で損益通算してから
+課税対象を算出します（`config.py` の `TAX_CONFIG`）。
+
+---
+
+## Discord 双方向 Bot（任意）
+
+Webhook は送信専用のため、**スタンプ（リアクション）で操作を反映する**には Bot を使います。
+有効化すると新規シグナルを1件ずつ個別通知してメッセージIDを保存し、その通知への
+リアクションでシグナル状態を更新できます（✅=約定を記録 / ❌=見送り）。
+
+```bash
+# 任意依存（未インストールでも本体は動く）
+.venv/bin/pip install discord.py
+
+# 個別通知を有効化（config.py）
+#   NOTIFY_CONFIG["per_signal_tracking"] = True
+
+# Bot を起動（DISCORD_BOT_TOKEN と API_BASE を .env / 環境変数に設定）
+.venv/bin/python -m notifier.discord_bot
+```
+
+---
+
 ## ⚠️ 重要な注意事項
 
 - **このツールは発注を行いません**。シグナルはあくまで参考情報です
@@ -305,7 +404,17 @@ ORDER_CONFIG = {
 
 ## 今後の拡張案
 
+実装済み:
+
+- [x] バックテスト機能（過去のシグナルが実際どうだったか検証）＋ Web実行
+- [x] Webでシグナル履歴・ライブ成績・スコア較正を可視化
+- [x] パラメータの Web 編集（実行時マージ）
+- [x] 口座残高からの推奨株数サイジング
+- [x] ライブ約定率の自動記録（期限切れ自動遷移）
+- [x] Discord 双方向 Bot（リアクションで約定/見送り・雛形）
+
+検討中:
+
+- [ ] 機械学習による売買パラメータ（しきい値）の最適化 ※シグナル自体はテクニカルのまま（`docs/ROADMAP_PLAN.md` に構想）
 - [ ] J-Quants APIで東証全銘柄を動的取得
 - [ ] 配当利回り・株主優待情報を加味したスクリーニング条件
-- [ ] Webダッシュボードでシグナル履歴を可視化
-- [ ] バックテスト機能（過去のシグナルが実際どうだったか検証）

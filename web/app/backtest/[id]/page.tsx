@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { use, useEffect, useState } from "react";
 import { BacktestRun, EquityPoint, getBacktestRun } from "@/lib/api";
 
 // ── SVG 資産曲線コンポーネント ────────────────────────────
@@ -121,15 +121,16 @@ function ann(v: number | null | undefined) {
 }
 
 // ── ページ本体 ────────────────────────────────────────────
-export default function BacktestDetailPage({ params }: { params: { id: string } }) {
+export default function BacktestDetailPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = use(params);   // Next.js 15: params は Promise なので use() で展開する
   const [run, setRun] = useState<BacktestRun | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    getBacktestRun(Number(params.id))
+    getBacktestRun(Number(id))
       .then(setRun)
       .catch((e) => setError(String(e)));
-  }, [params.id]);
+  }, [id]);
 
   const curve: EquityPoint[] = run?.equity_curve
     ? JSON.parse(run.equity_curve)

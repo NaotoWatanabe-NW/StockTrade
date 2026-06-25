@@ -4,8 +4,8 @@ import pytest
 
 from core.market import JP
 from data.db import get_connection
-from data.repository import list_signals
-from screener.signal_log import record_scan_signals
+from data.repository import list_signals, save_signal, get_signal_by_message_id
+from screener.signal_log import record_scan_signals, notify_and_link_signal
 
 
 @pytest.fixture
@@ -68,3 +68,30 @@ def test_signal_types_serialized(conn):
     s = list_signals(conn)[0]
     assert '"BREAKOUT_HIGH"' in s["signal_types"]
     assert '"MA_GOLDEN_CROSS"' in s["signal_types"]
+
+
+class _StubNotifier:
+    """send_signal_card が固定の message_id を返すスタブ。"""
+    def __init__(self, message_id):
+        self.message_id = message_id
+        self.sent = []
+
+    def send_signal_card(self, signal):
+        self.sent.append(signal)
+        return self.message_id
+
+
+def test_notify_and_link_stores_message_id(conn):
+    sig = save_signal(conn, code="7011", side="BUY", entry_price=1000, stop_price=950)
+    mid = notify_and_link_signal(conn, _StubNotifier("msg-123"), sig)
+    assert mid == "msg-123"
+    # メッセージID から逆引きできる
+    found = get_signal_by_message_id(conn, "msg-123")
+    assert found is not None and found["id"] == sig["id"]
+
+
+def test_notify_and_link_skips_storage_when_not_sent(conn):
+    sig = save_signal(conn, code="7011", side="BUY", entry_price=1000, stop_price=950)
+    mid = notify_and_link_signal(conn, _StubNotifier(None), sig)  # 送信不可
+    assert mid is None
+    assert get_signal_by_message_id(conn, "anything") is None

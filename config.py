@@ -208,6 +208,9 @@ NOTIFY_CONFIG = {
     # 長期保有(long_term=True)の銘柄は売り/手仕舞いを通知せず、買い増しタイミングのみ通知
     #   ※ この挙動は long_term フラグ自体で常に有効（下のフラグはマスタースイッチ）
     "long_term_buy_only": True,
+    # 追跡用にシグナルを1件ずつ個別通知し、message_id を保存する（Discord双方向Bot用）。
+    # 有効化すると ✅=約定 / ❌=見送り のリアクションで状態を更新できる。
+    "per_signal_tracking": False,
 }
 
 # ──────────────────────────────────────────
@@ -301,3 +304,92 @@ OPTIMIZE_CONFIG = {
         "breakout_lookback":  [15, 20, 30],    # ブレイクアウト判定期間
     },
 }
+
+# ──────────────────────────────────────────
+# 調整可能パラメータの永続上書き（settings テーブル → 実行時マージ）
+# ──────────────────────────────────────────
+# Webで編集した値を stock.db(settings) に保存し、各 config セクションの
+# getter（get_screening_config 等）がデフォルトに上書きして返す。スキャン/
+# バックテストはこの getter 経由で読むため、編集が次回実行に即反映される。
+#
+# PARAM_SECTIONS: 調整可能パラメータ → ライブで参照される config セクション名。
+#   ※ min_abs_score のライブ参照先は SCORING_CONFIG（screener.engine が scoring から読む）。
+#     バックテストでは simulator が backtest_cfg から読むため runner 側で補正する。
+PARAM_SECTIONS = {
+    "atr_entry_pullback":  "TRADE_PLAN_CONFIG",
+    "atr_stop_mult":       "TRADE_PLAN_CONFIG",
+    "reward_risk_ratio":   "TRADE_PLAN_CONFIG",
+    "trail_atr_mult":      "EXIT_CONFIG",
+    "partial_tp_r":        "EXIT_CONFIG",
+    "partial_tp_pct":      "EXIT_CONFIG",
+    "move_to_breakeven":   "EXIT_CONFIG",
+    "min_abs_score":       "SCORING_CONFIG",
+    "breakout_lookback":   "SCREENING_CONFIG",
+    "ma_short":            "SCREENING_CONFIG",
+    "ma_long":             "SCREENING_CONFIG",
+    "rsi_period":          "SCREENING_CONFIG",
+    "rsi_oversold":        "SCREENING_CONFIG",
+    "rsi_overbought":      "SCREENING_CONFIG",
+    "volume_spike_ratio":  "SCREENING_CONFIG",
+    "weekly_trend_filter": "REGIME_CONFIG",
+    "adx_min":             "REGIME_CONFIG",
+    "index_ma":            "REGIME_CONFIG",
+    "account_size":        "RISK_CONFIG",
+    "risk_per_trade_pct":  "RISK_CONFIG",
+    "max_positions":       "RISK_CONFIG",
+}
+
+
+def load_param_overrides() -> dict:
+    """settings テーブルから保存済みのパラメータ上書きを読む。無ければ {}。
+
+    DB が無い・読めない場合はデフォルト運用（空 dict）にフォールバックする。
+    """
+    try:
+        from data.db import get_connection, db_path
+        if not os.path.exists(db_path()):
+            return {}
+        from data.repository import get_param_overrides
+        conn = get_connection()
+        try:
+            return get_param_overrides(conn)
+        finally:
+            conn.close()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"パラメータ上書きの読込に失敗しました: {e}")
+        return {}
+
+
+def _effective_section(section_name: str, overrides: dict | None = None) -> dict:
+    """指定セクションのデフォルトに、そのセクション宛の上書きをマージして返す。"""
+    base = dict(globals()[section_name])
+    ov = load_param_overrides() if overrides is None else overrides
+    for param, value in ov.items():
+        if PARAM_SECTIONS.get(param) == section_name:
+            base[param] = value
+    return base
+
+
+def get_screening_config() -> dict:
+    return _effective_section("SCREENING_CONFIG")
+
+
+def get_scoring_config() -> dict:
+    return _effective_section("SCORING_CONFIG")
+
+
+def get_trade_plan_config() -> dict:
+    return _effective_section("TRADE_PLAN_CONFIG")
+
+
+def get_exit_config() -> dict:
+    return _effective_section("EXIT_CONFIG")
+
+
+def get_regime_config() -> dict:
+    return _effective_section("REGIME_CONFIG")
+
+
+def get_risk_config() -> dict:
+    return _effective_section("RISK_CONFIG")

@@ -11,9 +11,13 @@ from data.repository import (
     list_trades, add_trade, delete_trade, realized_pnl,
     sync_holding_from_trades,
     save_signal, get_signal, list_signals, update_signal_status,
+    set_signal_message_id, get_signal_by_message_id, signals_pending_notification,
     exists_open_signal_today, expire_stale_signals, signal_attribution,
     _on_signal_trade_change, save_backtest_run,
     realized_pnl_summary,
+    save_signal_outcome, get_signal_outcome, signals_needing_outcome_eval,
+    score_calibration,
+    get_param_overrides, save_param_overrides,
 )
 
 
@@ -172,6 +176,83 @@ class TestRealizedPnlSummary:
         assert jp["realized_after_tax"] == -5_000
 
 
+class TestSignalOutcomes:
+    def _buy_signal(self, conn, code="7203", score=50.0):
+        return save_signal(
+            conn, code=code, side="BUY", score=score,
+            entry_price=1000.0, stop_price=950.0, target_price=1100.0,
+            entry_kind="LIMIT",
+        )
+
+    def _outcome(self, outcome="TARGET", realized_r=2.0, **kw):
+        base = {
+            "horizon_days": 20, "entry_filled": True, "entry_fill_date": "2026-01-06",
+            "outcome": outcome, "hit_target": outcome == "TARGET",
+            "hit_stop": outcome == "STOP", "days_to_resolve": 3,
+            "mfe_r": 2.1, "mae_r": -0.4, "close_at_horizon": None,
+            "realized_r": realized_r, "eval_through": "2026-01-20",
+        }
+        base.update(kw)
+        return base
+
+    def test_save_and_get_round_trip_converts_bools_to_int(self, conn):
+        sig = self._buy_signal(conn)
+        save_signal_outcome(conn, sig["id"], self._outcome())
+        got = get_signal_outcome(conn, sig["id"])
+        assert got["outcome"] == "TARGET"
+        assert got["entry_filled"] == 1 and got["hit_target"] == 1
+        assert got["realized_r"] == 2.0
+
+    def test_save_is_idempotent_upsert(self, conn):
+        sig = self._buy_signal(conn)
+        save_signal_outcome(conn, sig["id"], self._outcome(outcome="PENDING", realized_r=None))
+        save_signal_outcome(conn, sig["id"], self._outcome(outcome="TARGET", realized_r=2.0))
+        got = get_signal_outcome(conn, sig["id"])
+        assert got["outcome"] == "TARGET"        # 再評価で上書きされる
+        rows = conn.execute("SELECT COUNT(*) c FROM signal_outcomes").fetchone()
+        assert rows["c"] == 1                     # 1シグナル1行
+
+    def test_pending_signal_needs_reevaluation_but_resolved_does_not(self, conn):
+        resolved = self._buy_signal(conn, code="7203")
+        pending = self._buy_signal(conn, code="6758")
+        unscored = self._buy_signal(conn, code="9984")
+        save_signal_outcome(conn, resolved["id"], self._outcome(outcome="TARGET"))
+        save_signal_outcome(conn, pending["id"], self._outcome(outcome="PENDING", realized_r=None))
+        # unscored は結果行なし
+        codes = {s["code"] for s in signals_needing_outcome_eval(conn)}
+        assert codes == {"6758", "9984"}         # 確定済み 7203 は除外
+
+    def test_sell_signals_are_not_listed_for_evaluation(self, conn):
+        save_signal(conn, code="7203", side="SELL", entry_price=1000, stop_price=1050)
+        assert signals_needing_outcome_eval(conn) == []
+
+    def test_calibration_separates_by_score_bucket(self, conn):
+        # 低スコア(20-40)は損切、高スコア(60-80)は利確に決着させる
+        low = self._buy_signal(conn, code="1111", score=30.0)
+        high = self._buy_signal(conn, code="2222", score=70.0)
+        save_signal_outcome(conn, low["id"], self._outcome(outcome="STOP", realized_r=-1.0))
+        save_signal_outcome(conn, high["id"], self._outcome(outcome="TARGET", realized_r=2.0))
+
+        buckets = {(b["score_lo"], b["score_hi"]): b for b in score_calibration(conn)}
+        lo_b = buckets[(20, 40)]
+        hi_b = buckets[(60, 80)]
+        assert lo_b["n_entered"] == 1 and lo_b["win_rate"] == 0.0 and lo_b["avg_r"] == -1.0
+        assert hi_b["n_entered"] == 1 and hi_b["win_rate"] == 1.0 and hi_b["avg_r"] == 2.0
+        assert hi_b["n_target"] == 1 and lo_b["n_stop"] == 1
+
+    def test_calibration_excludes_no_entry_from_entered_stats(self, conn):
+        s1 = self._buy_signal(conn, code="1111", score=50.0)
+        s2 = self._buy_signal(conn, code="2222", score=55.0)
+        save_signal_outcome(conn, s1["id"], self._outcome(outcome="TARGET", realized_r=2.0))
+        save_signal_outcome(conn, s2["id"], self._outcome(
+            outcome="NO_ENTRY", realized_r=None, entry_filled=False))
+        b = next(b for b in score_calibration(conn) if (b["score_lo"], b["score_hi"]) == (40, 60))
+        assert b["n_signals"] == 2          # 両方カウント
+        assert b["n_entered"] == 1          # 約定は1件のみ
+        assert b["entry_rate"] == 0.5
+        assert b["win_rate"] == 1.0         # 約定分（TARGET）のみで算出
+
+
 class TestBacktestRunRepository:
     def test_save_and_get_returns_same_run(self, conn):
         from data.repository import save_backtest_run, get_backtest_run
@@ -303,11 +384,83 @@ class TestSignals:
         _on_signal_trade_change(conn, s["id"])
         assert get_signal(conn, s["id"])["status"] == "SKIPPED"
 
+    def test_message_id_round_trip(self, conn):
+        s = self._buy_signal(conn)
+        assert get_signal_by_message_id(conn, "m-1") is None
+        set_signal_message_id(conn, s["id"], "m-1")
+        found = get_signal_by_message_id(conn, "m-1")
+        assert found is not None and found["id"] == s["id"]
+
+    def test_pending_notification_excludes_already_notified(self, conn):
+        a = self._buy_signal(conn)
+        b = self._buy_signal(conn)
+        set_signal_message_id(conn, b["id"], "m-b")   # 通知済みは対象外
+        ids = {p["id"] for p in signals_pending_notification(conn)}
+        assert a["id"] in ids
+        assert b["id"] not in ids
+
     def test_exists_open_signal_today_dedup(self, conn):
         assert exists_open_signal_today(conn, "7011", "BUY") is False
         self._buy_signal(conn)
         assert exists_open_signal_today(conn, "7011", "BUY") is True
         assert exists_open_signal_today(conn, "7011", "SELL") is False
+
+    def test_signal_without_trades_reports_zero_fill_aggregates(self, conn):
+        s = self._buy_signal(conn)
+        sig = get_signal(conn, s["id"])
+        assert sig["filled_shares"] == 0
+        assert sig["sold_shares"] == 0
+        assert sig["remaining_shares"] == 0
+        assert sig["avg_fill_price"] is None
+        assert sig["position_value"] is None
+
+    def test_fill_aggregates_weighted_average_and_position_value(self, conn):
+        s = self._buy_signal(conn)
+        # 2回に分けて買い：(1000×100 + 1020×100)/200 = 平均1010、残200株
+        add_trade(conn, code="7011", side="BUY", shares=100, price=1000,
+                  traded_at="2026-06-01", signal_id=s["id"])
+        add_trade(conn, code="7011", side="BUY", shares=100, price=1020,
+                  traded_at="2026-06-02", signal_id=s["id"])
+        sig = get_signal(conn, s["id"])
+        assert sig["filled_shares"] == 200
+        assert sig["remaining_shares"] == 200
+        assert sig["avg_fill_price"] == pytest.approx(1010.0)
+        assert sig["position_value"] == pytest.approx(200 * 1010.0)
+
+    def test_partial_close_reduces_remaining_shares(self, conn):
+        s = self._buy_signal(conn)
+        add_trade(conn, code="7011", side="BUY", shares=100, price=1000,
+                  traded_at="2026-06-01", signal_id=s["id"])
+        add_trade(conn, code="7011", side="SELL", shares=40, price=1100,
+                  traded_at="2026-06-10", signal_id=s["id"])
+        sig = get_signal(conn, s["id"])
+        assert sig["filled_shares"] == 100
+        assert sig["sold_shares"] == 40
+        assert sig["remaining_shares"] == 60
+        assert sig["avg_sell_price"] == pytest.approx(1100.0)
+
+    def test_list_signals_aggregates_only_own_linked_trades(self, conn):
+        a = self._buy_signal(conn)
+        b = self._buy_signal(conn)
+        add_trade(conn, code="7011", side="BUY", shares=100, price=1000,
+                  traded_at="2026-06-01", signal_id=a["id"])
+        # 別シグナルbには紐付けない単独取引（signal_id=None）も混在させる
+        add_trade(conn, code="7011", side="BUY", shares=300, price=1000,
+                  traded_at="2026-06-01")
+        by_id = {s["id"]: s for s in list_signals(conn)}
+        assert by_id[a["id"]]["filled_shares"] == 100
+        assert by_id[b["id"]]["filled_shares"] == 0
+
+    def test_list_trades_filters_by_signal_id(self, conn):
+        s = self._buy_signal(conn)
+        add_trade(conn, code="7011", side="BUY", shares=100, price=1000,
+                  traded_at="2026-06-01", signal_id=s["id"])
+        add_trade(conn, code="7011", side="BUY", shares=200, price=1000,
+                  traded_at="2026-06-01")  # 単独注文（紐付けなし）
+        linked = list_trades(conn, signal_id=s["id"])
+        assert len(linked) == 1
+        assert linked[0]["shares"] == 100
+        assert linked[0]["signal_id"] == s["id"]
 
     def test_attribution_live_vs_backtest(self, conn):
         # バックテスト期待値を1件保存
@@ -335,3 +488,18 @@ class TestSignals:
         assert a["bt_avg_r"] == pytest.approx(0.094)          # バックテスト期待値
         # 終局3件中2件約定 → take_rate = 2/3
         assert a["take_rate"] == pytest.approx(2 / 3)
+
+
+class TestParamOverrides:
+    def test_empty_when_unset(self, conn):
+        assert get_param_overrides(conn) == {}
+
+    def test_save_and_get_round_trip(self, conn):
+        save_param_overrides(conn, {"breakout_lookback": 40, "trail_atr_mult": 2.5})
+        got = get_param_overrides(conn)
+        assert got == {"breakout_lookback": 40, "trail_atr_mult": 2.5}
+
+    def test_save_replaces_previous(self, conn):
+        save_param_overrides(conn, {"breakout_lookback": 40})
+        save_param_overrides(conn, {"trail_atr_mult": 2.0})
+        assert get_param_overrides(conn) == {"trail_atr_mult": 2.0}

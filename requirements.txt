@@ -10,3 +10,6 @@ uvicorn[standard]>=0.29
 # 開発・テスト
 pytest>=8.0
 httpx>=0.27
+
+# 任意: Discord双方向Bot（notifier/discord_bot.py）。未インストールでも本体・テストは動く。
+# discord.py>=2.3
