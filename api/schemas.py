@@ -72,6 +72,16 @@ class WatchlistOut(WatchlistIn):
     created_at: str
 
 
+class NameLookup(BaseModel):
+    """コード→銘柄名の解決結果。"""
+    code: str
+    name: Optional[str] = None
+    source: Optional[str] = None   # "db" / "yfinance" / None
+
+
+
+
+
 class BacktestRunOut(BaseModel):
     id: int
     run_at: str

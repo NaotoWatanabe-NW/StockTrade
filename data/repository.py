@@ -89,6 +89,24 @@ def delete_holding(conn: sqlite3.Connection, code: str) -> bool:
     return cur.rowcount > 0
 
 
+def find_known_name(conn: sqlite3.Connection, code: str) -> Optional[str]:
+    """既に登録済みの同一コードの銘柄名を DB 横断で探す（無ければ None）。
+
+    holdings → watchlist → trades → signals の順に、空でない name を1件返す。
+    コードからの銘柄名オートフィルで、まずネットワーク不要の既知名を使うための関数。
+    """
+    for table in ("holdings", "watchlist", "trades", "signals"):
+        row = conn.execute(
+            f"SELECT name FROM {table} "
+            f"WHERE code = ? AND name IS NOT NULL AND name != '' "
+            f"ORDER BY id DESC LIMIT 1",
+            (code,),
+        ).fetchone()
+        if row and row["name"]:
+            return row["name"]
+    return None
+
+
 # ── trades ──────────────────────────────────────────────────
 
 def get_trade(conn: sqlite3.Connection, trade_id: int) -> Optional[dict]:

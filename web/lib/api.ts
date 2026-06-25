@@ -112,6 +112,14 @@ export const deleteTrade = (id: number) =>
 
 export const getPnl = () => req<PnlResponse>("/api/pnl");
 
+export type NameLookup = { code: string; name: string | null; source: string | null };
+
+export const lookupName = (code: string, market?: string) =>
+  req<NameLookup>(
+    `/api/lookup/name?code=${encodeURIComponent(code)}` +
+      (market ? `&market=${encodeURIComponent(market)}` : "")
+  );
+
 export const getWatchlist = () => req<WatchlistItem[]>("/api/watchlist");
 export const upsertWatchlistItem = (item: WatchlistItem) =>
   req<WatchlistItem>("/api/watchlist", { method: "POST", body: JSON.stringify(item) });

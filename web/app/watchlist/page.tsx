@@ -6,6 +6,7 @@ import {
   getWatchlist,
   upsertWatchlistItem,
   deleteWatchlistItem,
+  lookupName,
   isJP,
 } from "@/lib/api";
 
@@ -24,6 +25,22 @@ export default function WatchlistPage() {
   const [editing, setEditing] = useState(false);
   const [error, setError] = useState("");
   const [filter, setFilter] = useState<"ALL" | "JP" | "US">("ALL");
+  const [lookingUp, setLookingUp] = useState(false);
+
+  // コード入力後、銘柄名が空なら自動補完する（既存の入力は上書きしない）
+  const autoFillName = async () => {
+    const code = form.code.trim();
+    if (!code || editing || form.name.trim()) return;
+    setLookingUp(true);
+    try {
+      const r = await lookupName(code, form.market || undefined);
+      if (r.name) setForm((f) => (f.name.trim() ? f : { ...f, name: r.name! }));
+    } catch {
+      /* 取得失敗時は無視（手入力できる） */
+    } finally {
+      setLookingUp(false);
+    }
+  };
 
   const load = () =>
     getWatchlist()
@@ -111,14 +128,15 @@ export default function WatchlistPage() {
                 disabled={editing}
                 placeholder="7203 / AAPL"
                 onChange={(e) => setForm({ ...form, code: e.target.value })}
+                onBlur={autoFillName}
                 style={{ width: 110 }}
               />
             </label>
             <label>
-              銘柄名
+              銘柄名{lookingUp ? "（取得中…）" : ""}
               <input
                 value={form.name}
-                placeholder="任意"
+                placeholder="コード入力で自動補完"
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
                 style={{ width: 160 }}
               />

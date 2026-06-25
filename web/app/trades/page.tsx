@@ -8,6 +8,7 @@ import {
   getTrades,
   addTrade,
   deleteTrade,
+  lookupName,
   fmtPrice,
 } from "@/lib/api";
 
@@ -41,11 +42,27 @@ export default function TradesPage() {
   const [items, setItems] = useState<Trade[]>([]);
   const [form, setForm] = useState<FormState>(empty());
   const [error, setError] = useState("");
+  const [lookingUp, setLookingUp] = useState(false);
 
   const load = () =>
     getTrades()
       .then(setItems)
       .catch((e) => setError(String(e)));
+
+  // コード入力後、銘柄名が空なら自動補完する（既存の入力は上書きしない）
+  const autoFillName = async () => {
+    const code = form.code.trim();
+    if (!code || form.name.trim()) return;
+    setLookingUp(true);
+    try {
+      const r = await lookupName(code);
+      if (r.name) setForm((f) => (f.name.trim() ? f : { ...f, name: r.name! }));
+    } catch {
+      /* 取得失敗時は無視（手入力できる） */
+    } finally {
+      setLookingUp(false);
+    }
+  };
 
   useEffect(() => {
     load();
@@ -101,13 +118,15 @@ export default function TradesPage() {
                 value={form.code}
                 placeholder="7203 / AAPL"
                 onChange={(e) => setForm({ ...form, code: e.target.value })}
+                onBlur={autoFillName}
                 style={{ width: 110 }}
               />
             </label>
             <label>
-              銘柄名
+              銘柄名{lookingUp ? "（取得中…）" : ""}
               <input
                 value={form.name}
+                placeholder="コード入力で自動補完"
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
                 style={{ width: 140 }}
               />

@@ -400,6 +400,29 @@ class TestLiveExpiryApi:
         assert a["take_rate"] == 0
 
 
+class TestNameLookupApi:
+    def test_returns_known_name_from_db_without_network(self, client):
+        client.post("/api/holdings", json={"code": "7203", "name": "トヨタ自動車"})
+        r = client.get("/api/lookup/name", params={"code": "7203"}).json()
+        assert r["name"] == "トヨタ自動車"
+        assert r["source"] == "db"
+
+    def test_empty_code_returns_null_name(self, client):
+        r = client.get("/api/lookup/name", params={"code": "  "}).json()
+        assert r["name"] is None and r["source"] is None
+
+    def test_falls_back_to_yfinance_for_unknown_code(self, client, monkeypatch):
+        # 未登録コードは外部取得（yfinance）にフォールバックする。ネットワークは差し替え。
+        from core.data_client import StockDataClient
+        monkeypatch.setattr(
+            StockDataClient, "get_info",
+            lambda self, code, market=None: {"code": code, "name": "Apple Inc."},
+        )
+        r = client.get("/api/lookup/name", params={"code": "AAPL"}).json()
+        assert r["name"] == "Apple Inc."
+        assert r["source"] == "yfinance"
+
+
 class TestSizingApi:
     def _open_buy(self, code="7011", entry=1000.0, stop=950.0):
         from data.db import get_connection

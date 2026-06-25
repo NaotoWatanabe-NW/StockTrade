@@ -89,6 +89,24 @@ class TestTrades:
         assert list_trades(conn) == []
 
 
+class TestFindKnownName:
+    def test_returns_name_from_holdings(self, conn):
+        upsert_holding(conn, code="7203", name="トヨタ自動車")
+        from data.repository import find_known_name
+        assert find_known_name(conn, "7203") == "トヨタ自動車"
+
+    def test_falls_back_across_tables(self, conn):
+        from data.repository import find_known_name
+        # holdings には無いが trades にはある
+        add_trade(conn, code="6758", side="BUY", shares=100, price=1000,
+                  traded_at="2026-06-01", name="ソニーG")
+        assert find_known_name(conn, "6758") == "ソニーG"
+
+    def test_returns_none_for_unknown_code(self, conn):
+        from data.repository import find_known_name
+        assert find_known_name(conn, "9999") is None
+
+
 class TestSyncHoldingFromTrades:
     def test_buy_trade_updates_avg_price_and_shares(self, conn):
         upsert_holding(conn, code="7203", name="トヨタ", avg_price=2700, shares=100)
