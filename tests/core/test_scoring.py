@@ -6,7 +6,10 @@
 import math
 import pandas as pd
 
-from core.scoring import compute_consensus, _label, DEFAULT_SCORING_CONFIG
+from core.scoring import (
+    compute_consensus, _label, _score_sector,
+    DEFAULT_SCORING_CONFIG, DEFAULT_SECTOR_SCORING,
+)
 
 # 中立な指標行。末尾2足を上書きして特定の地合いを作る。
 NEUTRAL = {
@@ -103,3 +106,64 @@ class TestWeightsAreConfigurable:
     def test_breakout_weight_dominates_to_sell(self):
         c = compute_consensus(self.MIXED, self._cfg(breakout=1))
         assert c.score == -100.0 and c.side == "SELL"
+
+
+# 短い期間でも算出できる業種スコア設定（テスト用）
+SECTOR_CFG = {"index_ma": 5, "ma_slope_lookback": 3, "rs_lookback": 5, "rs_scale": 0.10,
+              "trend_weight": 0.5, "rs_weight": 0.5}
+
+
+def _dated_close_df(values, start="2024-01-01"):
+    idx = pd.date_range(start, periods=len(values), freq="D")
+    return pd.DataFrame({"close": values}, index=idx)
+
+
+class TestSectorComponent:
+    # 株価・業種ともに同じ日付軸を持つ8本。業種は緩やかな上昇/下降を作る。
+    STOCK_UP = _dated_close_df([100, 101, 102, 103, 104, 105, 106, 110])
+    SECTOR_UP = _dated_close_df([100, 100.5, 101, 101.5, 102, 102.5, 103, 103.5])
+    SECTOR_DOWN = _dated_close_df([100, 99.5, 99, 98.5, 98, 97.5, 97, 96.5])
+
+    def test_uptrend_sector_gives_positive_component(self):
+        comp = _score_sector(self.STOCK_UP, self.SECTOR_UP, DEFAULT_SCORING_CONFIG, SECTOR_CFG)
+        assert comp is not None and comp.name == "sector"
+        assert comp.score > 0          # 業種が上昇トレンド＋銘柄がアウトパフォーム
+
+    def test_downtrend_sector_gives_negative_component(self):
+        # 銘柄も業種より弱くする（横ばい）と相対強度も負に寄る
+        stock_flat = _dated_close_df([100] * 8)
+        comp = _score_sector(stock_flat, self.SECTOR_DOWN, DEFAULT_SCORING_CONFIG, SECTOR_CFG)
+        assert comp is not None
+        assert comp.score < 0          # 業種が下降トレンド
+
+    def test_insufficient_sector_history_returns_none(self):
+        short_sector = _dated_close_df([100, 101, 102])   # index_ma/rs_lookback に満たない
+        comp = _score_sector(self.STOCK_UP, short_sector, DEFAULT_SCORING_CONFIG, SECTOR_CFG)
+        assert comp is None
+
+    def test_uses_default_sector_scoring_when_cfg_omitted(self):
+        # sector_cfg 省略時は DEFAULT_SECTOR_SCORING（index_ma=50 等）で要求期間が長い
+        comp = _score_sector(self.STOCK_UP, self.SECTOR_UP, DEFAULT_SCORING_CONFIG, None)
+        assert comp is None            # 8本では既定の50期間に満たず None
+        assert DEFAULT_SECTOR_SCORING["index_ma"] == 50
+
+
+class TestConsensusWithSector:
+    STOCK_UP = _dated_close_df([100, 101, 102, 103, 104, 105, 106, 110])
+    SECTOR_UP = _dated_close_df([100, 100.5, 101, 101.5, 102, 102.5, 103, 103.5])
+
+    def _stock_frame(self):
+        # 合議スコアの5成分が計算できる指標列を、業種スコア用の日付軸に載せる
+        rows = [dict(NEUTRAL) for _ in range(len(self.STOCK_UP))]
+        df = pd.DataFrame(rows, index=self.STOCK_UP.index)
+        df["close"] = self.STOCK_UP["close"].values
+        return df
+
+    def test_sector_component_absent_without_df_sector(self):
+        c = compute_consensus(self._stock_frame(), DEFAULT_SCORING_CONFIG)
+        assert "sector" not in {comp.name for comp in c.components}
+
+    def test_sector_component_present_with_df_sector(self):
+        c = compute_consensus(self._stock_frame(), DEFAULT_SCORING_CONFIG,
+                              df_sector=self.SECTOR_UP, sector_cfg=SECTOR_CFG)
+        assert "sector" in {comp.name for comp in c.components}

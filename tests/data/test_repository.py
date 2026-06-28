@@ -8,8 +8,8 @@ import pytest
 from data.db import get_connection
 from data.repository import (
     list_holdings, get_holding, upsert_holding, delete_holding,
-    list_trades, add_trade, delete_trade, realized_pnl,
-    sync_holding_from_trades,
+    list_trades, get_trade, add_trade, delete_trade, realized_pnl,
+    sync_holding_from_trades, apply_share_adjustment,
     save_signal, get_signal, list_signals, update_signal_status,
     set_signal_message_id, get_signal_by_message_id, signals_pending_notification,
     exists_open_signal_today, expire_stale_signals, signal_attribution,
@@ -18,6 +18,7 @@ from data.repository import (
     save_signal_outcome, get_signal_outcome, signals_needing_outcome_eval,
     score_calibration,
     get_param_overrides, save_param_overrides,
+    upsert_sectors, get_sector_map, list_sectors,
 )
 
 
@@ -26,6 +27,36 @@ def conn():
     c = get_connection(":memory:")
     yield c
     c.close()
+
+
+class TestSectors:
+    def test_upsert_and_get_sector_map_roundtrip(self, conn):
+        n = upsert_sectors(conn, [
+            {"code": "7203", "sector_group": "自動車・輸送機", "market_code": "JP"},
+            {"code": "8306", "sector_group": "銀行", "market_code": "JP"},
+            {"code": "AAPL", "sector_group": "Technology", "market_code": "US"},
+        ])
+        assert n == 3
+        m = get_sector_map(conn)
+        assert m["7203"] == "自動車・輸送機"
+        assert m["AAPL"] == "Technology"
+
+    def test_get_sector_map_filters_by_market(self, conn):
+        upsert_sectors(conn, [
+            {"code": "7203", "sector_group": "自動車・輸送機", "market_code": "JP"},
+            {"code": "AAPL", "sector_group": "Technology", "market_code": "US"},
+        ])
+        assert get_sector_map(conn, market="US") == {"AAPL": "Technology"}
+
+    def test_upsert_replaces_existing_code(self, conn):
+        upsert_sectors(conn, [{"code": "7203", "sector_group": "A", "market_code": "JP"}])
+        upsert_sectors(conn, [{"code": "7203", "sector_group": "B", "market_code": "JP"}])
+        assert len(list_sectors(conn)) == 1
+        assert get_sector_map(conn)["7203"] == "B"
+
+    def test_sector_map_excludes_rows_without_group(self, conn):
+        upsert_sectors(conn, [{"code": "X", "sector_group": None, "market_code": "JP"}])
+        assert "X" not in get_sector_map(conn)
 
 
 class TestHoldings:
@@ -105,6 +136,87 @@ class TestFindKnownName:
     def test_returns_none_for_unknown_code(self, conn):
         from data.repository import find_known_name
         assert find_known_name(conn, "9999") is None
+
+
+class TestShareAdjustment:
+    def test_split_scales_holding_shares_up_and_price_down(self, conn):
+        upsert_holding(conn, code="7203", shares=100, avg_price=3000.0)
+        apply_share_adjustment(conn, "7203", 1, 2)        # 1株→2株（分割）
+        h = get_holding(conn, "7203")
+        assert h["shares"] == 200
+        assert h["avg_price"] == pytest.approx(1500.0)
+
+    def test_consolidation_scales_holding_inversely(self, conn):
+        upsert_holding(conn, code="6758", shares=100, avg_price=1000.0)
+        apply_share_adjustment(conn, "6758", 4, 1)        # 4株→1株（併合）
+        h = get_holding(conn, "6758")
+        assert h["shares"] == pytest.approx(25)
+        assert h["avg_price"] == pytest.approx(4000.0)
+
+    def test_total_cost_is_preserved(self, conn):
+        upsert_holding(conn, code="7203", shares=100, avg_price=3000.0)
+        apply_share_adjustment(conn, "7203", 2, 5)        # 端数の出る比率でも総額不変
+        h = get_holding(conn, "7203")
+        assert h["shares"] * h["avg_price"] == pytest.approx(100 * 3000.0)
+
+    def test_scales_trades_preserving_each_value(self, conn):
+        upsert_holding(conn, code="7203", shares=100, avg_price=3000.0)
+        add_trade(conn, code="7203", side="BUY", shares=100, price=3000,
+                  traded_at="2026-06-01")
+        apply_share_adjustment(conn, "7203", 1, 2)
+        t = list_trades(conn, code="7203")[0]
+        assert t["shares"] == 200
+        assert t["price"] == pytest.approx(1500.0)
+
+    def test_only_trades_before_effective_date_are_adjusted(self, conn):
+        upsert_holding(conn, code="7203", shares=100, avg_price=3000.0)
+        old = add_trade(conn, code="7203", side="BUY", shares=100, price=3000,
+                        traded_at="2026-06-09")
+        new = add_trade(conn, code="7203", side="BUY", shares=100, price=1500,
+                        traded_at="2026-06-10")  # 効力発生日当日＝調整対象外
+        apply_share_adjustment(conn, "7203", 1, 2, effective_date="2026-06-10")
+        assert get_trade(conn, old["id"])["shares"] == 200     # 前日分は調整
+        assert get_trade(conn, new["id"])["shares"] == 100     # 当日分は据え置き
+
+    def test_realized_pnl_amount_unchanged_after_split(self, conn):
+        upsert_holding(conn, code="7203", shares=0, avg_price=3000.0)
+        add_trade(conn, code="7203", side="BUY", shares=100, price=3000, traded_at="2026-06-01")
+        add_trade(conn, code="7203", side="SELL", shares=100, price=3300, traded_at="2026-06-05")
+        before = realized_pnl(conn)[0]["realized"]
+        apply_share_adjustment(conn, "7203", 1, 2, effective_date="2026-06-10")
+        after = realized_pnl(conn)[0]["realized"]
+        assert after == pytest.approx(before)   # 分割で実現損益の金額は変わらない
+
+    def test_clears_price_cache_for_code(self, conn):
+        upsert_holding(conn, code="7203", shares=100, avg_price=3000.0)
+        conn.execute(
+            "INSERT INTO price_history (code, interval, date, close) VALUES ('7203','1d','2026-06-01',3000)"
+        )
+        conn.commit()
+        report = apply_share_adjustment(conn, "7203", 1, 2)
+        assert report["cache_cleared"] == 1
+        rows = conn.execute("SELECT COUNT(*) c FROM price_history WHERE code='7203'").fetchone()
+        assert rows["c"] == 0
+
+    def test_keep_cache_leaves_price_history(self, conn):
+        upsert_holding(conn, code="7203", shares=100, avg_price=3000.0)
+        conn.execute(
+            "INSERT INTO price_history (code, interval, date, close) VALUES ('7203','1d','2026-06-01',3000)"
+        )
+        conn.commit()
+        apply_share_adjustment(conn, "7203", 1, 2, clear_cache=False)
+        rows = conn.execute("SELECT COUNT(*) c FROM price_history WHERE code='7203'").fetchone()
+        assert rows["c"] == 1
+
+    def test_dry_run_writes_nothing(self, conn):
+        upsert_holding(conn, code="7203", shares=100, avg_price=3000.0)
+        report = apply_share_adjustment(conn, "7203", 1, 2, dry_run=True)
+        assert report["holding_after"]["shares"] == 200       # プレビューには反映
+        assert get_holding(conn, "7203")["shares"] == 100      # DBは未変更
+
+    def test_rejects_nonpositive_ratio(self, conn):
+        with pytest.raises(ValueError):
+            apply_share_adjustment(conn, "7203", 0, 2)
 
 
 class TestSyncHoldingFromTrades:

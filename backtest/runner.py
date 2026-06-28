@@ -27,6 +27,7 @@ from backtest.metrics import compute_metrics, format_report
 from backtest.optimizer import run_walk_forward, format_wf_report
 from backtest.simulator import Trade, NoFill, simulate_symbol
 from core.market import resolve_market
+from core.sector import build_sector_indices, sector_series_for
 from data.db import get_connection
 from data.price_cache import get_history_cached
 
@@ -35,7 +36,7 @@ log = logging.getLogger(__name__)
 
 def _run_optimize(
     args, universe, screening_cfg, scoring_cfg, trade_plan_cfg,
-    backtest_cfg, exit_cfg, regime_cfg, years,
+    backtest_cfg, exit_cfg, regime_cfg, years, sector_cfg=None,
 ) -> int:
     """ウォークフォワード最適化を実行してレポートを出力する。"""
     optimize_cfg = config.OPTIMIZE_CONFIG
@@ -62,6 +63,8 @@ def _run_optimize(
 
         if regime_cfg:
             _fetch_index_df(regime_cfg, universe, index_dfs)
+
+        code_to_group, sector_indices = _build_sector_context(conn, universe_dfs, sector_cfg)
     finally:
         conn.close()
 
@@ -79,6 +82,9 @@ def _run_optimize(
         regime_cfg=regime_cfg,
         weekly_dfs=weekly_dfs if weekly_dfs else None,
         index_dfs=index_dfs if index_dfs else None,
+        sector_cfg=sector_cfg,
+        code_to_group=code_to_group if code_to_group else None,
+        sector_indices=sector_indices if sector_indices else None,
     )
 
     print(format_wf_report(result))
@@ -105,6 +111,28 @@ def _fetch_index_df(regime_cfg: dict, universe: list, index_by_market: dict) -> 
             log.info(f"  取得完了: {idx_code} ({len(df)} bars)")
         except Exception as e:
             log.warning(f"  指数取得失敗 {idx_code}: {e}")
+
+
+def _build_sector_context(conn, universe_dfs: dict, sector_cfg: Optional[dict]) -> tuple[dict, dict]:
+    """業種スコア用の (code→sector_group, {group: 合成インデックス}) を構築する。
+
+    sector_cfg が None（業種スコア無効）または業種分類が未同期なら空 dict を返し、
+    df_sector が全銘柄 None ＝ 従来挙動にフォールバックする。
+    """
+    if not sector_cfg:
+        return {}, {}
+    from data.repository import get_sector_map
+    code_to_group = get_sector_map(conn)
+    if not code_to_group:
+        log.warning("業種分類(sectors)が空です。`python -m scripts.sync_sectors` で同期してください。"
+                    "今回は業種スコアをスキップします。")
+        return {}, {}
+    indices = build_sector_indices(
+        universe_dfs, code_to_group,
+        min_constituents=int(sector_cfg.get("min_constituents", 3)),
+    )
+    log.info(f"業種合成インデックスを構築: {len(indices)} 業種")
+    return code_to_group, indices
 
 
 def _build_backtest_cfg(args, base: dict) -> dict:
@@ -182,6 +210,7 @@ def run_backtest(
     universe: str = "ALL",
     *,
     regime: bool = True,
+    sector: bool = True,
     no_partial_tp: bool = False,
     min_score: Optional[float] = None,
     param_overrides: Optional[dict] = None,
@@ -228,6 +257,11 @@ def run_backtest(
             exit_cfg["partial_tp_pct"] = 0.0
             exit_cfg["move_to_breakeven"] = False
         regime_cfg = config._effective_section("REGIME_CONFIG", overrides) if regime else None
+        sector_cfg = None
+        if sector:
+            _sc = config._effective_section("SECTOR_CONFIG", overrides)
+            if _sc.get("enabled", True):
+                sector_cfg = _sc
 
         _apply_param_overrides(param_overrides, {
             "screening": screening_cfg, "scoring": scoring_cfg,
@@ -240,30 +274,41 @@ def run_backtest(
         if regime_cfg:
             _fetch_index_df(regime_cfg, codes, index_by_market)
 
+        # 日足を全銘柄プリロード（業種合成インデックスの構築に全構成銘柄が必要）
+        universe_dfs: dict[str, object] = {}
         for code in codes:
             market = resolve_market(code)
-            log.info(f"処理中: {code} [{market.code}]")
-
             if no_cache:
                 from core.data_client import StockDataClient
                 client = StockDataClient(rate_limit_sec=1.0)
                 df = client.get_history(code, market, period=f"{years}y", interval="1d")
             else:
                 df = get_history_cached(conn, code, market, interval="1d", years=years)
-
             if df is None or df.empty:
                 log.warning(f"  スキップ（データなし）: {code}")
                 continue
+            universe_dfs[code] = df
+
+        # 業種スコア用の合成インデックスを構築（sector_cfg 有効時のみ）
+        code_to_group, sector_indices = _build_sector_context(conn, universe_dfs, sector_cfg)
+
+        for code, df in universe_dfs.items():
+            market = resolve_market(code)
+            log.info(f"処理中: {code} [{market.code}]")
 
             df_weekly = None
             if regime_cfg and regime_cfg.get("weekly_trend_filter", True):
                 df_weekly = get_history_cached(conn, code, market, interval="1wk", years=years)
+
+            df_sector = sector_series_for(code, code_to_group, sector_indices) if sector_cfg else None
 
             trades, no_fills = simulate_symbol(
                 code, df, screening_cfg, scoring_cfg, trade_plan_cfg, backtest_cfg, exit_cfg,
                 regime_cfg=regime_cfg,
                 df_weekly=df_weekly,
                 df_index=index_by_market.get(market.code),
+                df_sector=df_sector,
+                sector_cfg=sector_cfg,
             )
             all_trades.extend(trades)
             all_no_fills.extend(no_fills)
@@ -288,6 +333,7 @@ def run_backtest(
             "exit_cfg":       exit_cfg,
             "backtest_cfg":   backtest_cfg,
             "regime":         bool(regime_cfg),
+            "sector":         bool(sector_cfg),
         }
 
         run_id = None
@@ -361,13 +407,18 @@ def run(args) -> int:
             exit_cfg["partial_tp_pct"] = 0.0
             exit_cfg["move_to_breakeven"] = False
         regime_cfg = None if args.no_regime else config.REGIME_CONFIG
+        sector_cfg = None
+        if not args.no_sector and config.SECTOR_CONFIG.get("enabled", True):
+            sector_cfg = config.SECTOR_CONFIG
         years = int(backtest_cfg.get("history", "5y").rstrip("y"))
         return _run_optimize(args, universe, config.SCREENING_CONFIG, config.SCORING_CONFIG,
-                             config.TRADE_PLAN_CONFIG, backtest_cfg, exit_cfg, regime_cfg, years)
+                             config.TRADE_PLAN_CONFIG, backtest_cfg, exit_cfg, regime_cfg, years,
+                             sector_cfg=sector_cfg)
 
     result = run_backtest(
         universe=args.universe,
         regime=not args.no_regime,
+        sector=not args.no_sector,
         no_partial_tp=args.no_partial_tp,
         min_score=args.min_score,
         no_cache=args.no_cache,
@@ -389,6 +440,8 @@ def main():
                         help="部分利確なし（Phase 1 互換モード）")
     parser.add_argument("--no-regime", action="store_true",
                         help="レジームフィルタを無効化して Phase 2 と同条件で比較")
+    parser.add_argument("--no-sector", action="store_true",
+                        help="業種スコア成分を無効化（業種スコアありとの A/B 比較用）")
     parser.add_argument("--optimize", action="store_true",
                         help="ウォークフォワード最適化を実行（通常バックテストの代わりに）")
     parser.add_argument("--save", action="store_true",

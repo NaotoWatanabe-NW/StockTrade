@@ -112,6 +112,8 @@ def simulate_symbol(
     regime_cfg: Optional[dict] = None,
     df_weekly: Optional[pd.DataFrame] = None,
     df_index: Optional[pd.DataFrame] = None,
+    df_sector: Optional[pd.DataFrame] = None,
+    sector_cfg: Optional[dict] = None,
 ) -> tuple[list[Trade], list[NoFill]]:
     """
     1 銘柄に対してバックテストを実行し、トレード履歴と不約定記録を返す。
@@ -121,6 +123,7 @@ def simulate_symbol(
     regime_cfg : REGIME_CONFIG（None の場合はレジームフィルタを適用しない）
     df_weekly  : 銘柄の週足 OHLCV（週足トレンドフィルタに使用）
     df_index   : 指数の日足 OHLCV（指数レジームフィルタに使用）
+    df_sector  : 所属業種の合成インデックス（業種スコア成分に使用。None なら成分なし）
 
     backtest_cfg の主なキー:
         entry_order_valid_days : エントリー注文の有効期限（営業日数）
@@ -246,7 +249,7 @@ def simulate_symbol(
             if not rf["passed"]:
                 continue
 
-        consensus = compute_consensus(df_t, scoring_cfg)
+        consensus = compute_consensus(df_t, scoring_cfg, df_sector=df_sector, sector_cfg=sector_cfg)
         score = consensus.score if consensus else None
 
         if min_abs_score > 0 and (score is None or abs(score) < min_abs_score):

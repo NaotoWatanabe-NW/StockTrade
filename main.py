@@ -180,6 +180,7 @@ def main():
         risk_config=risk_config,              # Phase 2: 推奨株数サイジング
         regime_config=config.get_regime_config(),  # Phase 3: 週足/指数/ADX フィルタ
         events_config=config.EVENTS_CONFIG,   # Phase 3: 決算回避フィルタ
+        sector_config=config.get_sector_config(),  # 業種トレンド/相対強度スコア
     )
 
     holdings_count = len(config.get_holdings())

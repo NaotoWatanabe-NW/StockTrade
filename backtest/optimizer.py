@@ -35,6 +35,7 @@ import pandas as pd
 from backtest.metrics import compute_metrics
 from backtest.simulator import Trade, NoFill, simulate_symbol
 from core.indicators import add_technical_indicators
+from core.sector import sector_series_for
 
 log = logging.getLogger(__name__)
 
@@ -163,6 +164,9 @@ def run_walk_forward(
     regime_cfg: Optional[dict] = None,
     weekly_dfs: Optional[dict[str, pd.DataFrame]] = None,
     index_dfs: Optional[dict[str, pd.DataFrame]] = None,
+    sector_cfg: Optional[dict] = None,
+    code_to_group: Optional[dict[str, str]] = None,
+    sector_indices: Optional[dict[str, pd.DataFrame]] = None,
 ) -> WalkForwardResult:
     """
     ウォークフォワード最適化を実行する。
@@ -170,7 +174,16 @@ def run_walk_forward(
     universe_dfs : {code: raw_ohlcv_df}  各銘柄の全期間 OHLCV
     weekly_dfs   : {code: weekly_ohlcv_df}（レジームフィルタ用。省略可）
     index_dfs    : {market_code: index_ohlcv_df}（レジームフィルタ用。省略可）
+    sector_cfg   : SECTOR_CONFIG（業種スコア用。None なら業種成分なし）
+    code_to_group / sector_indices : 業種スコア用の合成インデックス（省略可）
     """
+    code_to_group = code_to_group or {}
+    sector_indices = sector_indices or {}
+
+    def _df_sector(code: str) -> Optional[pd.DataFrame]:
+        if not sector_cfg:
+            return None
+        return sector_series_for(code, code_to_group, sector_indices)
     is_years    = int(optimize_cfg.get("is_years",   3))
     oos_years   = int(optimize_cfg.get("oos_years",  1))
     step_years  = int(optimize_cfg.get("step_years", 1))
@@ -241,6 +254,8 @@ def run_walk_forward(
                     regime_cfg=regime_cfg,
                     df_weekly=df_wk,
                     df_index=df_ix,
+                    df_sector=_df_sector(code),
+                    sector_cfg=sector_cfg,
                 )
                 is_trades.extend(t)
                 is_nofills.extend(nf)
@@ -276,6 +291,8 @@ def run_walk_forward(
                 regime_cfg=regime_cfg,
                 df_weekly=df_wk,
                 df_index=df_ix,
+                df_sector=_df_sector(code),
+                sector_cfg=sector_cfg,
             )
             oos_trades.extend(t)
             oos_nofills.extend(nf)

@@ -169,6 +169,7 @@ SCORING_CONFIG = {
         "rsi":      0.15,   # 売られ/買われすぎ
         "volume":   0.15,   # 出来高の裏付け
         "breakout": 0.20,   # 高安レンジ内の位置
+        "sector":   0.15,   # 業種トレンド＋業種内相対強度（SECTOR_CONFIG・業種データがある時のみ寄与）
     },
     "thresholds": {"strong": 60, "weak": 20},  # |スコア| の閾値（強い/弱い）
     "rsi_low":            30,
@@ -253,6 +254,27 @@ REGIME_CONFIG = {
     "index_ma":            50,        # 指数の移動平均期間（価格がMA上 = 強気レジーム）
     "weekly_trend_filter": True,      # 週足トレンドフィルタを有効にするか
     "adx_min":             20,        # ADX がこの値未満ならチョップ相場として見送り
+}
+
+# ──────────────────────────────────────────
+# 業種（セクター）スコア設定（core/sector.py + scoring._score_sector が参照）
+# ──────────────────────────────────────────
+# 「銘柄が属する業種が上昇トレンドか」「業種内で相対的に強いか」を合議スコアの
+# sector コンポーネント(-1〜+1)として加点する。業種分類は J-Quants 無料版(JP)/
+# yfinance(US) から取得して DB(sectors) にキャッシュ済みのものを使い、トレンド自体は
+# ユニバース構成銘柄の日足から合成インデックスを作って算出する（価格の追加取得なし）。
+#   enabled が False、または業種データ/構成数が不足する銘柄は sector 成分を出さず
+#   従来スコアに無害フォールバックする（compute_consensus が総重みで正規化するため）。
+SECTOR_CONFIG = {
+    "enabled":          True,
+    "grouping":         "sector17",  # 合成インデックスのグルーピング（JP=17業種 / US=yfinance sector）
+    "index_ma":         50,          # 合成業種インデックスの移動平均期間（トレンド判定）
+    "ma_slope_lookback": 10,         # 業種インデックスの傾きを見る期間
+    "rs_lookback":      60,          # 相対強度を測るリターンの参照期間（営業日）
+    "rs_scale":         0.10,        # 相対強度の正規化幅（業種比+10%アウトパフォームで+1.0）
+    "min_constituents": 3,           # 合成インデックスに必要な最低構成銘柄数（未満は成分なし）
+    "trend_weight":     0.5,         # sector 成分内での「業種トレンド」の比重
+    "rs_weight":        0.5,         # sector 成分内での「相対強度」の比重
 }
 
 # ──────────────────────────────────────────
@@ -389,6 +411,10 @@ def get_exit_config() -> dict:
 
 def get_regime_config() -> dict:
     return _effective_section("REGIME_CONFIG")
+
+
+def get_sector_config() -> dict:
+    return _effective_section("SECTOR_CONFIG")
 
 
 def get_risk_config() -> dict:

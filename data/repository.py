@@ -7,6 +7,7 @@ holdings / trades のデータアクセス層（CRUD）
 
 import re
 import sqlite3
+from datetime import date
 from typing import Optional
 
 _HOLDING_FIELDS = ("code", "name", "avg_price", "shares", "market", "long_term")
@@ -212,6 +213,82 @@ def sync_holding_from_trades(conn: sqlite3.Connection, code: str) -> None:
     conn.commit()
 
 
+def apply_share_adjustment(
+    conn: sqlite3.Connection,
+    code: str,
+    from_shares: float,
+    to_shares: float,
+    effective_date: Optional[str] = None,
+    clear_cache: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    """株式分割・併合に伴い、保有・約定の株数と単価を比率調整する。
+
+    from_shares 株 → to_shares 株（分割 1→2 は from=1,to=2 / 併合 4→1 は from=4,to=1）。
+      株数倍率 = to/from、単価倍率 = from/to。株数×単価（総額）は不変。
+    対象:
+      - holdings: shares ×株数倍率、avg_price ×単価倍率（保有を直接スケール）
+      - trades  : effective_date より前(traded_at <)の約定の shares/price を同様にスケール
+                  （総額・実現損益の金額は不変。sync_holding_from_trades とも整合する）
+      - price_history: clear_cache=True なら当該コードを削除（次回取得で分割調整後を取り直す）
+    effective_date 既定は当日。dry_run=True なら書き込まず変更プレビューの dict を返す。
+    signals（過去のシグナル計画値）は対象外。
+    """
+    if from_shares <= 0 or to_shares <= 0:
+        raise ValueError("from_shares / to_shares は正である必要があります")
+
+    eff = effective_date or date.today().isoformat()
+    share_mult = to_shares / from_shares
+    price_mult = from_shares / to_shares
+
+    trades = conn.execute(
+        "SELECT id, side, shares, price FROM trades WHERE code = ? AND traded_at < ?",
+        (code, eff),
+    ).fetchall()
+    holding = get_holding(conn, code)
+
+    report = {
+        "code": code,
+        "from_shares": from_shares,
+        "to_shares": to_shares,
+        "share_mult": share_mult,
+        "price_mult": price_mult,
+        "effective_date": eff,
+        "trades_adjusted": len(trades),
+        "holding_before": None,
+        "holding_after": None,
+        "cache_cleared": 0,
+    }
+    if holding:
+        hb_shares, hb_avg = holding.get("shares"), holding.get("avg_price")
+        report["holding_before"] = {"shares": hb_shares, "avg_price": hb_avg}
+        report["holding_after"] = {
+            "shares":    hb_shares * share_mult if hb_shares is not None else None,
+            "avg_price": hb_avg * price_mult if hb_avg is not None else None,
+        }
+
+    if dry_run:
+        return report
+
+    for t in trades:
+        conn.execute(
+            "UPDATE trades SET shares = ?, price = ? WHERE id = ?",
+            (t["shares"] * share_mult, t["price"] * price_mult, t["id"]),
+        )
+    if holding:
+        after = report["holding_after"]
+        conn.execute(
+            "UPDATE holdings SET shares = ?, avg_price = ?, updated_at = datetime('now') "
+            "WHERE code = ?",
+            (after["shares"], after["avg_price"], code),
+        )
+    if clear_cache:
+        cur = conn.execute("DELETE FROM price_history WHERE code = ?", (code,))
+        report["cache_cleared"] = cur.rowcount
+    conn.commit()
+    return report
+
+
 # ── watchlist ────────────────────────────────────────────────
 
 def _watchlist_row_to_dict(row: sqlite3.Row) -> dict:
@@ -267,6 +344,73 @@ def watchlist_codes(conn: sqlite3.Connection) -> list[str]:
     """スクリーニング用にコードだけ返す"""
     rows = conn.execute("SELECT code FROM watchlist ORDER BY code").fetchall()
     return [r["code"] for r in rows]
+
+
+# ── sectors（銘柄→業種の分類キャッシュ） ────────────────────────────
+
+_SECTOR_FIELDS = (
+    "code", "name", "sector17_code", "sector17_name",
+    "sector33_code", "sector33_name", "sector_group", "market_code",
+)
+
+
+def upsert_sectors(conn: sqlite3.Connection, rows: list[dict]) -> int:
+    """業種分類をまとめて upsert する（code をキーに置換）。書き込んだ件数を返す。
+
+    各 row は _SECTOR_FIELDS のサブセット（最低限 code）を持つ dict。
+    sync_sectors が J-Quants(JP)/yfinance(US) から集めた結果を流し込むのに使う。
+    """
+    payload = []
+    for r in rows:
+        code = r.get("code")
+        if not code:
+            continue
+        payload.append({f: r.get(f) for f in _SECTOR_FIELDS})
+    if not payload:
+        return 0
+    conn.executemany(
+        """
+        INSERT INTO sectors
+            (code, name, sector17_code, sector17_name,
+             sector33_code, sector33_name, sector_group, market_code)
+        VALUES
+            (:code, :name, :sector17_code, :sector17_name,
+             :sector33_code, :sector33_name, :sector_group, :market_code)
+        ON CONFLICT(code) DO UPDATE SET
+            name          = excluded.name,
+            sector17_code = excluded.sector17_code,
+            sector17_name = excluded.sector17_name,
+            sector33_code = excluded.sector33_code,
+            sector33_name = excluded.sector33_name,
+            sector_group  = excluded.sector_group,
+            market_code   = excluded.market_code,
+            updated_at    = datetime('now')
+        """,
+        payload,
+    )
+    conn.commit()
+    return len(payload)
+
+
+def get_sector_map(conn: sqlite3.Connection, market: Optional[str] = None) -> dict:
+    """code → sector_group の対応を返す。market("JP"/"US") で絞り込み可能。
+
+    sector_group が NULL/空 の銘柄は除外する（合成インデックスのグルーピングに
+    使えないため）。スクリーニング/バックテストが業種スコアを付けるための土台。
+    """
+    sql = "SELECT code, sector_group FROM sectors WHERE sector_group IS NOT NULL AND sector_group != ''"
+    params: list = []
+    if market:
+        sql += " AND market_code = ?"
+        params.append(market)
+    rows = conn.execute(sql, params).fetchall()
+    return {r["code"]: r["sector_group"] for r in rows}
+
+
+def list_sectors(conn: sqlite3.Connection) -> list[dict]:
+    """登録済みの業種分類を全件返す（code 昇順）。"""
+    rows = conn.execute("SELECT * FROM sectors ORDER BY code").fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── pnl ─────────────────────────────────────────────────────

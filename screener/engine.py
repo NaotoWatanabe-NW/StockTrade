@@ -17,6 +17,7 @@ from core.events import should_avoid_earnings
 from core.market import Market, resolve_market
 from core.orders import build_order
 from core.scoring import DEFAULT_SCORING_CONFIG
+from core.sector import build_sector_indices, sector_series_for
 from core.strategy import evaluate
 
 log = logging.getLogger(__name__)
@@ -28,7 +29,8 @@ class StockScreener:
                  scoring_config: dict | None = None,
                  risk_config: dict | None = None,
                  regime_config: dict | None = None,
-                 events_config: dict | None = None):
+                 events_config: dict | None = None,
+                 sector_config: dict | None = None):
         self.client = client
         self.config = config
         self.trade_plan_config = trade_plan_config
@@ -37,6 +39,8 @@ class StockScreener:
         self.risk_config = risk_config      # None の場合はサイジングを行わない
         self.regime_config = regime_config  # None の場合はレジームフィルタなし
         self.events_config = events_config  # None の場合は決算回避なし
+        # None または enabled=False の場合は業種スコアなし
+        self.sector_config = sector_config if (sector_config and sector_config.get("enabled", True)) else None
 
     def _fetch_index(self, market_code: str) -> Optional[pd.DataFrame]:
         """指数日足データを取得（scan_universe で1回だけ呼ぶ）"""
@@ -55,17 +59,56 @@ class StockScreener:
             log.warning(f"指数データ取得失敗 {code}: {e}")
             return None
 
+    def _sector_map(self) -> dict:
+        """DB(sectors) から code→sector_group を読む（DB が無ければ空 dict）。"""
+        try:
+            from data.db import get_connection, db_path
+            import os
+            if not os.path.exists(db_path()):
+                return {}
+            from data.repository import get_sector_map
+            conn = get_connection()
+            try:
+                return get_sector_map(conn)
+            finally:
+                conn.close()
+        except Exception as e:
+            log.warning(f"業種分類の読込に失敗、業種スコアをスキップします: {e}")
+            return {}
+
+    def _build_sector_indices(self, daily_cache: dict) -> tuple[dict, dict]:
+        """事前取得した日足から (code→group, {group: 合成インデックス}) を構築する。"""
+        if not self.sector_config:
+            return {}, {}
+        code_to_group = self._sector_map()
+        if not code_to_group:
+            log.info("業種分類が未同期のため業種スコアをスキップ（python -m scripts.sync_sectors で同期）")
+            return {}, {}
+        indices = build_sector_indices(
+            daily_cache, code_to_group,
+            min_constituents=int(self.sector_config.get("min_constituents", 3)),
+        )
+        return code_to_group, indices
+
     def _decide(self, code: str, market: Market,
                 df_weekly: Optional[pd.DataFrame] = None,
-                df_index: Optional[pd.DataFrame] = None):
-        """1銘柄を取得して strategy.evaluate() に委譲する"""
-        df = self.client.get_history(code, market, period="6mo", interval="1d")
+                df_index: Optional[pd.DataFrame] = None,
+                df_sector: Optional[pd.DataFrame] = None,
+                df_daily: Optional[pd.DataFrame] = None):
+        """1銘柄を取得して strategy.evaluate() に委譲する。
+
+        df_daily を渡せば再取得せずそれを使う（業種インデックス構築で取得済みの再利用）。
+        """
+        df = df_daily if df_daily is not None else self.client.get_history(
+            code, market, period="6mo", interval="1d")
         return evaluate(
             df, self.config, self.scoring_config, self.trade_plan_config,
             risk_cfg=self.risk_config, market_code=market.code,
             regime_cfg=self.regime_config,
             df_weekly=df_weekly,
             df_index=df_index,
+            df_sector=df_sector,
+            sector_cfg=self.sector_config,
         )
 
     def _order(self, context: str, plan, market: Market):
@@ -82,6 +125,19 @@ class StockScreener:
         # 指数データはスキャン開始時に1回取得（JP / US 各1回）
         index_cache: dict[str, Optional[pd.DataFrame]] = {}
 
+        # 業種スコア有効時: 全銘柄の日足を先に取得して合成インデックスを構築する。
+        # 取得した日足は評価でも再利用し、二重取得（レート制限）を避ける。
+        daily_cache: dict[str, pd.DataFrame] = {}
+        code_to_group: dict = {}
+        sector_indices: dict = {}
+        if self.sector_config:
+            for code in codes:
+                market = resolve_market(code)
+                df = self.client.get_history(code, market, period="6mo", interval="1d")
+                if df is not None and not df.empty:
+                    daily_cache[code] = df
+            code_to_group, sector_indices = self._build_sector_indices(daily_cache)
+
         for code in codes:
             market = resolve_market(code)
 
@@ -95,7 +151,11 @@ class StockScreener:
             if self.regime_config and self.regime_config.get("weekly_trend_filter", True):
                 df_weekly = self.client.get_history(code, market, period="2y", interval="1wk")
 
-            d = self._decide(code, market, df_weekly=df_weekly, df_index=df_index)
+            df_sector = (sector_series_for(code, code_to_group, sector_indices)
+                         if self.sector_config else None)
+
+            d = self._decide(code, market, df_weekly=df_weekly, df_index=df_index,
+                             df_sector=df_sector, df_daily=daily_cache.get(code))
             if d is None:
                 continue
 

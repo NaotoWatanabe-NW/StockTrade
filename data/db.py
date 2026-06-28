@@ -132,6 +132,23 @@ CREATE TABLE IF NOT EXISTS watchlist (
 
 CREATE INDEX IF NOT EXISTS idx_watchlist_code ON watchlist(code);
 
+-- 銘柄→業種の分類（コード一意）。J-Quants 無料版(JP)/yfinance(US) から取得して
+-- キャッシュする。sector_group は実際に合議スコアのグルーピングに使う粗い業種名
+-- （JP=17業種名 / US=yfinance sector）。分類はほぼ静的なので遅延の影響を受けない。
+CREATE TABLE IF NOT EXISTS sectors (
+    code           TEXT PRIMARY KEY,
+    name           TEXT,
+    sector17_code  TEXT,
+    sector17_name  TEXT,
+    sector33_code  TEXT,
+    sector33_name  TEXT,
+    sector_group   TEXT,                       -- スコアのグルーピングに使う業種名
+    market_code    TEXT,                       -- "JP"/"US"
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sectors_group ON sectors(sector_group);
+
 CREATE TABLE IF NOT EXISTS backtest_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     run_at          TEXT    NOT NULL DEFAULT (datetime('now')),  -- 実行日時 ISO

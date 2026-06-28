@@ -53,6 +53,8 @@ def evaluate(
     regime_cfg: Optional[dict] = None,
     df_weekly: Optional[pd.DataFrame] = None,
     df_index: Optional[pd.DataFrame] = None,
+    df_sector: Optional[pd.DataFrame] = None,
+    sector_cfg: Optional[dict] = None,
 ) -> Optional[Decision]:
     """
     OHLCV DataFrame の最新バーに対して意思決定を行い Decision を返す。
@@ -75,7 +77,7 @@ def evaluate(
         df = add_technical_indicators(df, cfg)
 
     signals = detect_signals(df, cfg)
-    consensus = compute_consensus(df, scoring_cfg)
+    consensus = compute_consensus(df, scoring_cfg, df_sector=df_sector, sector_cfg=sector_cfg)
 
     latest = df.iloc[-1]
     prev = df.iloc[-2]

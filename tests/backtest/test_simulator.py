@@ -158,3 +158,50 @@ class TestMetricsIntegration:
         )
         # SELL シグナルの場合 side != "BUY" で skip されるので entries は 0
         assert all(t.side == "BUY" for t in trades)
+
+
+# 業種スコア付きの設定（sector 重みを足す）と、短期間でも算出できる SECTOR_CONFIG
+SCORING_CFG_SECTOR = {**SCORING_CFG,
+                      "weights": {**SCORING_CFG["weights"], "sector": 0.30}}
+SECTOR_CFG = {"index_ma": 5, "ma_slope_lookback": 3, "rs_lookback": 5, "rs_scale": 0.10,
+              "trend_weight": 0.5, "rs_weight": 0.5, "min_constituents": 3}
+
+
+def _dated_df(closes, start="2024-01-01"):
+    """終値リストから DatetimeIndex 付き OHLCV を作る（業種インデックスと日付を揃える）。"""
+    idx = pd.date_range(start, periods=len(closes), freq="B")
+    return pd.DataFrame({
+        "open": closes, "high": [c + 1 for c in closes],
+        "low": [c - 1 for c in closes], "close": closes,
+        "volume": [500_000] * len(closes),
+    }, index=idx)
+
+
+class TestSectorContext:
+    # index 29 で高値ブレイク → 逆指値(STOP)エントリー、index 30 で hi が届いて約定
+    BREAKOUT = _dated_df([1000.0] * 29 + [1100.0, 1150.0])
+    SECTOR_UP = pd.DataFrame(
+        {"close": [100.0 + 0.5 * i for i in range(31)]},
+        index=pd.date_range("2024-01-01", periods=31, freq="B"),
+    )
+
+    def test_passing_df_sector_still_produces_trade(self):
+        trades, no_fills = simulate_symbol(
+            "T", self.BREAKOUT, CFG, SCORING_CFG_SECTOR, PLAN_CFG, BT_CFG,
+            df_sector=self.SECTOR_UP, sector_cfg=SECTOR_CFG,
+        )
+        assert any(t.filled for t in trades)
+
+    def test_uptrend_sector_raises_recorded_score(self):
+        with_sector, _ = simulate_symbol(
+            "T", self.BREAKOUT, CFG, SCORING_CFG_SECTOR, PLAN_CFG, BT_CFG,
+            df_sector=self.SECTOR_UP, sector_cfg=SECTOR_CFG,
+        )
+        without_sector, _ = simulate_symbol(
+            "T", self.BREAKOUT, CFG, SCORING_CFG_SECTOR, PLAN_CFG, BT_CFG,
+            df_sector=None,
+        )
+        s_with = next(t.score for t in with_sector if t.filled)
+        s_without = next(t.score for t in without_sector if t.filled)
+        # 業種が上昇トレンド＋銘柄がアウトパフォーム → スコアは上振れする
+        assert s_with > s_without
